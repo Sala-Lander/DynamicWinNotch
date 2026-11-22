@@ -1,0 +1,447 @@
+//! Minimal hand-written Win32 bindings (64-bit Windows only).
+//!
+//! Handles are plain `isize` (HWND, HDC, HBITMAP, HICON, HMENU, HINSTANCE, HKEY...), which has the
+//! same ABI as a pointer on x64/ARM64. Writing the ~60 declarations we need by hand avoids
+//! depending on the churn of a bindings crate; the `windows` crate is used only for WinRT.
+#![allow(non_snake_case, non_camel_case_types, dead_code, clippy::upper_case_acronyms)]
+
+use std::ffi::c_void;
+
+pub type HANDLE = isize;
+pub type WndProc = unsafe extern "system" fn(HANDLE, u32, usize, isize) -> isize;
+
+// ---------------------------------------------------------------- structs
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct POINT {
+    pub x: i32,
+    pub y: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SIZE {
+    pub cx: i32,
+    pub cy: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct RECT {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+#[repr(C)]
+#[derive(Default)]
+pub struct MSG {
+    pub hwnd: HANDLE,
+    pub message: u32,
+    pub wparam: usize,
+    pub lparam: isize,
+    pub time: u32,
+    pub pt: POINT,
+}
+#[repr(C)]
+pub struct WNDCLASSEXW {
+    pub cbSize: u32,
+    pub style: u32,
+    pub lpfnWndProc: Option<WndProc>,
+    pub cbClsExtra: i32,
+    pub cbWndExtra: i32,
+    pub hInstance: HANDLE,
+    pub hIcon: HANDLE,
+    pub hCursor: HANDLE,
+    pub hbrBackground: HANDLE,
+    pub lpszMenuName: *const u16,
+    pub lpszClassName: *const u16,
+    pub hIconSm: HANDLE,
+}
+#[repr(C)]
+pub struct BLENDFUNCTION {
+    pub BlendOp: u8,
+    pub BlendFlags: u8,
+    pub SourceConstantAlpha: u8,
+    pub AlphaFormat: u8,
+}
+#[repr(C)]
+#[derive(Default)]
+pub struct BITMAPINFOHEADER {
+    pub biSize: u32,
+    pub biWidth: i32,
+    pub biHeight: i32,
+    pub biPlanes: u16,
+    pub biBitCount: u16,
+    pub biCompression: u32,
+    pub biSizeImage: u32,
+    pub biXPelsPerMeter: i32,
+    pub biYPelsPerMeter: i32,
+    pub biClrUsed: u32,
+    pub biClrImportant: u32,
+}
+#[repr(C)]
+#[derive(Default)]
+pub struct BITMAPINFO {
+    pub bmiHeader: BITMAPINFOHEADER,
+    pub bmiColors: [u32; 1],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct FILETIME {
+    pub dwLowDateTime: u32,
+    pub dwHighDateTime: u32,
+}
+impl FILETIME {
+    pub fn as_u64(&self) -> u64 {
+        ((self.dwHighDateTime as u64) << 32) | self.dwLowDateTime as u64
+    }
+}
+#[repr(C)]
+#[derive(Default)]
+pub struct MEMORYSTATUSEX {
+    pub dwLength: u32,
+    pub dwMemoryLoad: u32,
+    pub ullTotalPhys: u64,
+    pub ullAvailPhys: u64,
+    pub ullTotalPageFile: u64,
+    pub ullAvailPageFile: u64,
+    pub ullTotalVirtual: u64,
+    pub ullAvailVirtual: u64,
+    pub ullAvailExtendedVirtual: u64,
+}
+#[repr(C)]
+#[derive(Default)]
+pub struct SYSTEM_POWER_STATUS {
+    pub ACLineStatus: u8,
+    pub BatteryFlag: u8,
+    pub BatteryLifePercent: u8,
+    pub SystemStatusFlag: u8,
+    pub BatteryLifeTime: u32,
+    pub BatteryFullLifeTime: u32,
+}
+#[repr(C)]
+#[derive(Default)]
+pub struct MONITORINFO {
+    pub cbSize: u32,
+    pub rcMonitor: RECT,
+    pub rcWork: RECT,
+    pub dwFlags: u32,
+}
+#[repr(C)]
+pub struct RAWINPUTDEVICE {
+    pub usUsagePage: u16,
+    pub usUsage: u16,
+    pub dwFlags: u32,
+    pub hwndTarget: HANDLE,
+}
+/// Full (Vista+) layout of NOTIFYICONDATAW. The GUID is modelled as `[u32; 4]` (4-byte aligned, like GUID).
+#[repr(C)]
+pub struct NOTIFYICONDATAW {
+    pub cbSize: u32,
+    pub hWnd: HANDLE,
+    pub uID: u32,
+    pub uFlags: u32,
+    pub uCallbackMessage: u32,
+    pub hIcon: HANDLE,
+    pub szTip: [u16; 128],
+    pub dwState: u32,
+    pub dwStateMask: u32,
+    pub szInfo: [u16; 256],
+    pub uVersion: u32,
+    pub szInfoTitle: [u16; 64],
+    pub dwInfoFlags: u32,
+    pub guidItem: [u32; 4],
+    pub hBalloonIcon: HANDLE,
+}
+
+// -------------------------------------------------------------- constants
+pub const WS_POPUP: u32 = 0x8000_0000;
+pub const WS_EX_TOPMOST: u32 = 0x0000_0008;
+pub const WS_EX_TRANSPARENT: u32 = 0x0000_0020;
+pub const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+pub const WS_EX_LAYERED: u32 = 0x0008_0000;
+pub const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+pub const GWL_EXSTYLE: i32 = -20;
+
+pub const SW_HIDE: i32 = 0;
+pub const SW_SHOWNORMAL: i32 = 1;
+pub const SW_SHOWNOACTIVATE: i32 = 4;
+
+pub const SWP_NOSIZE: u32 = 0x0001;
+pub const SWP_NOMOVE: u32 = 0x0002;
+pub const SWP_NOACTIVATE: u32 = 0x0010;
+pub const HWND_TOPMOST: HANDLE = -1;
+pub const HWND_MESSAGE: HANDLE = -3;
+
+pub const ULW_ALPHA: u32 = 2;
+pub const AC_SRC_OVER: u8 = 0;
+pub const AC_SRC_ALPHA: u8 = 1;
+pub const BI_RGB: u32 = 0;
+pub const DIB_RGB_COLORS: u32 = 0;
+
+pub const PM_REMOVE: u32 = 1;
+pub const MA_NOACTIVATE: isize = 3;
+pub const IDC_ARROW: usize = 32512;
+
+pub const WM_NULL: u32 = 0x0000;
+pub const WM_DESTROY: u32 = 0x0002;
+pub const WM_QUIT: u32 = 0x0012;
+pub const WM_MOUSEACTIVATE: u32 = 0x0021;
+pub const WM_INPUT: u32 = 0x00FF;
+pub const WM_COMMAND: u32 = 0x0111;
+pub const WM_TIMER: u32 = 0x0113;
+pub const WM_MOUSEMOVE: u32 = 0x0200;
+pub const WM_LBUTTONDOWN: u32 = 0x0201;
+pub const WM_LBUTTONUP: u32 = 0x0202;
+pub const WM_RBUTTONDOWN: u32 = 0x0204;
+pub const WM_RBUTTONUP: u32 = 0x0205;
+pub const WM_MBUTTONDOWN: u32 = 0x0207;
+pub const WM_MOUSEWHEEL: u32 = 0x020A;
+pub const WM_MOUSEHWHEEL: u32 = 0x020E;
+pub const WM_DPICHANGED: u32 = 0x02E0;
+pub const WM_DISPLAYCHANGE: u32 = 0x007E;
+pub const WM_HOTKEY: u32 = 0x0312;
+pub const WM_CLIPBOARDUPDATE: u32 = 0x031D;
+pub const WM_APP: u32 = 0x8000;
+
+pub const MF_STRING: u32 = 0x0000;
+pub const MF_CHECKED: u32 = 0x0008;
+pub const MF_SEPARATOR: u32 = 0x0800;
+pub const TPM_RIGHTBUTTON: u32 = 0x0002;
+pub const TPM_BOTTOMALIGN: u32 = 0x0020;
+pub const TPM_RETURNCMD: u32 = 0x0100;
+
+pub const NIM_ADD: u32 = 0;
+pub const NIM_MODIFY: u32 = 1;
+pub const NIM_DELETE: u32 = 2;
+pub const NIF_MESSAGE: u32 = 1;
+pub const NIF_ICON: u32 = 2;
+pub const NIF_TIP: u32 = 4;
+
+pub const MOD_ALT: u32 = 1;
+pub const MOD_CONTROL: u32 = 2;
+pub const MOD_NOREPEAT: u32 = 0x4000;
+
+pub const RIDEV_INPUTSINK: u32 = 0x100;
+pub const MONITOR_DEFAULTTOPRIMARY: u32 = 1;
+
+pub const QUNS_BUSY: i32 = 2;
+pub const QUNS_RUNNING_D3D_FULL_SCREEN: i32 = 3;
+pub const QUNS_PRESENTATION_MODE: i32 = 4;
+
+pub const HKEY_CURRENT_USER: HANDLE = 0x8000_0001u32 as i32 as isize;
+pub const REG_SZ: u32 = 1;
+pub const RRF_RT_REG_SZ: u32 = 0x0000_0002;
+pub const ERROR_ALREADY_EXISTS: u32 = 183;
+
+// ---------------------------------------------------------------- imports
+#[link(name = "user32")]
+extern "system" {
+    pub fn RegisterClassExW(wc: *const WNDCLASSEXW) -> u16;
+    pub fn CreateWindowExW(
+        ex_style: u32,
+        class: *const u16,
+        title: *const u16,
+        style: u32,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        parent: HANDLE,
+        menu: HANDLE,
+        hinst: HANDLE,
+        param: *mut c_void,
+    ) -> HANDLE;
+    pub fn DefWindowProcW(hwnd: HANDLE, msg: u32, wp: usize, lp: isize) -> isize;
+    pub fn DestroyWindow(hwnd: HANDLE) -> i32;
+    pub fn GetMessageW(msg: *mut MSG, hwnd: HANDLE, min: u32, max: u32) -> i32;
+    pub fn PeekMessageW(msg: *mut MSG, hwnd: HANDLE, min: u32, max: u32, remove: u32) -> i32;
+    pub fn TranslateMessage(msg: *const MSG) -> i32;
+    pub fn DispatchMessageW(msg: *const MSG) -> isize;
+    pub fn PostMessageW(hwnd: HANDLE, msg: u32, wp: usize, lp: isize) -> i32;
+    pub fn PostQuitMessage(code: i32);
+    pub fn ShowWindow(hwnd: HANDLE, cmd: i32) -> i32;
+    pub fn SetWindowPos(hwnd: HANDLE, after: HANDLE, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
+    pub fn UpdateLayeredWindow(
+        hwnd: HANDLE,
+        hdc_dst: HANDLE,
+        ppt_dst: *const POINT,
+        psize: *const SIZE,
+        hdc_src: HANDLE,
+        ppt_src: *const POINT,
+        crkey: u32,
+        pblend: *const BLENDFUNCTION,
+        flags: u32,
+    ) -> i32;
+    pub fn GetWindowLongPtrW(hwnd: HANDLE, index: i32) -> isize;
+    pub fn SetWindowLongPtrW(hwnd: HANDLE, index: i32, value: isize) -> isize;
+    pub fn GetCursorPos(pt: *mut POINT) -> i32;
+    pub fn LoadCursorW(hinst: HANDLE, name: *const u16) -> HANDLE;
+    pub fn SetTimer(hwnd: HANDLE, id: usize, ms: u32, proc_: *const c_void) -> usize;
+    pub fn KillTimer(hwnd: HANDLE, id: usize) -> i32;
+    pub fn CreatePopupMenu() -> HANDLE;
+    pub fn AppendMenuW(menu: HANDLE, flags: u32, id: usize, text: *const u16) -> i32;
+    pub fn TrackPopupMenu(menu: HANDLE, flags: u32, x: i32, y: i32, reserved: i32, hwnd: HANDLE, rc: *const RECT) -> i32;
+    pub fn DestroyMenu(menu: HANDLE) -> i32;
+    pub fn SetForegroundWindow(hwnd: HANDLE) -> i32;
+    pub fn RegisterHotKey(hwnd: HANDLE, id: i32, modifiers: u32, vk: u32) -> i32;
+    pub fn UnregisterHotKey(hwnd: HANDLE, id: i32) -> i32;
+    pub fn RegisterRawInputDevices(devs: *const RAWINPUTDEVICE, count: u32, size: u32) -> i32;
+    pub fn RegisterWindowMessageW(name: *const u16) -> u32;
+    pub fn CreateIcon(
+        hinst: HANDLE,
+        w: i32,
+        h: i32,
+        planes: u8,
+        bpp: u8,
+        and_bits: *const u8,
+        xor_bits: *const u8,
+    ) -> HANDLE;
+    pub fn DestroyIcon(icon: HANDLE) -> i32;
+    pub fn MonitorFromPoint(pt: POINT, flags: u32) -> HANDLE;
+    pub fn GetMonitorInfoW(monitor: HANDLE, mi: *mut MONITORINFO) -> i32;
+    pub fn AddClipboardFormatListener(hwnd: HANDLE) -> i32;
+    pub fn RemoveClipboardFormatListener(hwnd: HANDLE) -> i32;
+    pub fn IsClipboardFormatAvailable(format: u32) -> i32;
+    pub fn GetClipboardSequenceNumber() -> u32;
+    pub fn RegisterClipboardFormatW(name: *const u16) -> u32;
+    pub fn GetDpiForSystem() -> u32;
+    pub fn GetDpiForWindow(hwnd: HANDLE) -> u32;
+    pub fn SetProcessDpiAwarenessContext(ctx: isize) -> i32;
+}
+
+#[link(name = "gdi32")]
+extern "system" {
+    pub fn CreateCompatibleDC(hdc: HANDLE) -> HANDLE;
+    pub fn CreateDIBSection(
+        hdc: HANDLE,
+        bmi: *const BITMAPINFO,
+        usage: u32,
+        bits: *mut *mut c_void,
+        section: HANDLE,
+        offset: u32,
+    ) -> HANDLE;
+    pub fn SelectObject(hdc: HANDLE, obj: HANDLE) -> HANDLE;
+    pub fn DeleteObject(obj: HANDLE) -> i32;
+    pub fn DeleteDC(hdc: HANDLE) -> i32;
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    pub fn GetModuleHandleW(name: *const u16) -> HANDLE;
+    pub fn GetLastError() -> u32;
+    pub fn CreateMutexW(attrs: *const c_void, initial_owner: i32, name: *const u16) -> HANDLE;
+    pub fn GetSystemTimes(idle: *mut FILETIME, kernel: *mut FILETIME, user: *mut FILETIME) -> i32;
+    pub fn GetSystemTimeAsFileTime(ft: *mut FILETIME);
+    pub fn GlobalMemoryStatusEx(ms: *mut MEMORYSTATUSEX) -> i32;
+    pub fn GetSystemPowerStatus(sps: *mut SYSTEM_POWER_STATUS) -> i32;
+    pub fn GetTickCount64() -> u64;
+    pub fn GetCurrentProcess() -> HANDLE;
+    pub fn SetProcessWorkingSetSize(process: HANDLE, min: usize, max: usize) -> i32;
+}
+
+#[link(name = "shell32")]
+extern "system" {
+    pub fn Shell_NotifyIconW(msg: u32, data: *mut NOTIFYICONDATAW) -> i32;
+    pub fn SHQueryUserNotificationState(state: *mut i32) -> i32;
+    pub fn ShellExecuteW(
+        hwnd: HANDLE,
+        verb: *const u16,
+        file: *const u16,
+        params: *const u16,
+        dir: *const u16,
+        show: i32,
+    ) -> isize;
+}
+
+#[link(name = "dwmapi")]
+extern "system" {
+    pub fn DwmFlush() -> i32;
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    pub fn RegSetKeyValueW(
+        key: HANDLE,
+        subkey: *const u16,
+        value: *const u16,
+        ty: u32,
+        data: *const c_void,
+        cb: u32,
+    ) -> i32;
+    pub fn RegDeleteKeyValueW(key: HANDLE, subkey: *const u16, value: *const u16) -> i32;
+    pub fn RegGetValueW(
+        key: HANDLE,
+        subkey: *const u16,
+        value: *const u16,
+        flags: u32,
+        ty: *mut u32,
+        data: *mut c_void,
+        cb: *mut u32,
+    ) -> i32;
+}
+
+#[link(name = "ole32")]
+extern "system" {
+    pub fn CoInitializeEx(reserved: *mut c_void, coinit: u32) -> i32;
+}
+
+// ---------------------------------------------------------------- helpers
+/// NUL-terminated UTF-16 for passing strings to the `W` APIs.
+pub fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Copy `s` into a fixed UTF-16 buffer (truncating), always leaving a trailing NUL.
+pub fn fill_wide<const N: usize>(dst: &mut [u16; N], s: &str) {
+    for (i, u) in s.encode_utf16().take(N - 1).enumerate() {
+        dst[i] = u;
+    }
+}
+
+pub fn loword(v: isize) -> i32 {
+    (v & 0xFFFF) as u16 as i16 as i32
+}
+
+pub fn hiword(v: isize) -> i32 {
+    ((v >> 16) & 0xFFFF) as u16 as i16 as i32
+}
+
+pub fn cursor_pos() -> (i32, i32) {
+    let mut p = POINT::default();
+    unsafe { GetCursorPos(&mut p) };
+    (p.x, p.y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn struct_sizes_match_win64_abi() {
+        // Values taken from the Windows SDK headers for x64.
+        assert_eq!(std::mem::size_of::<POINT>(), 8);
+        assert_eq!(std::mem::size_of::<RECT>(), 16);
+        assert_eq!(std::mem::size_of::<MSG>(), 48);
+        assert_eq!(std::mem::size_of::<WNDCLASSEXW>(), 80);
+        assert_eq!(std::mem::size_of::<BITMAPINFOHEADER>(), 40);
+        assert_eq!(std::mem::size_of::<MEMORYSTATUSEX>(), 64);
+        assert_eq!(std::mem::size_of::<SYSTEM_POWER_STATUS>(), 12);
+        assert_eq!(std::mem::size_of::<MONITORINFO>(), 40);
+        assert_eq!(std::mem::size_of::<RAWINPUTDEVICE>(), 16);
+        assert_eq!(std::mem::size_of::<NOTIFYICONDATAW>(), 976);
+    }
+
+    #[test]
+    fn words() {
+        assert_eq!(loword(0x0001_FFFEu32 as isize), -2);
+        assert_eq!(hiword(0xFF88_0001u32 as isize), -120);
+    }
+
+    #[test]
+    fn wide_is_nul_terminated() {
+        assert_eq!(wide("ab"), vec![97, 98, 0]);
+        let mut b = [0u16; 4];
+        fill_wide(&mut b, "abcdef");
+        assert_eq!(b, [97, 98, 99, 0]);
+    }
+}

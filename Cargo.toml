@@ -1,0 +1,38 @@
+[package]
+name = "notch-island"
+version = "0.1.0"
+edition = "2021"
+description = "A dynamic-island style notch overlay for Windows. Native Win32 + software rendering, no webview."
+license = "MIT"
+rust-version = "1.75"
+
+[dependencies]
+# CPU rasteriser for shapes (no PNG codec, no image stack).
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+# Pure-Rust glyph rasteriser. Fonts are read from C:\Windows\Fonts at run time,
+# so nothing is embedded in the exe.
+ab_glyph = "0.2"
+# Text-only clipboard access (image support disabled to keep RAM and binary size low).
+arboard = { version = "3.4", default-features = false }
+
+# The `windows` crate is used ONLY for WinRT (Global System Media Transport Controls and
+# thumbnail decoding). All plain Win32 calls are hand-declared in src/ffi.rs.
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Media",
+    "Media_Control",
+    "Graphics_Imaging",
+    "Storage_Streams",
+]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+incremental = false

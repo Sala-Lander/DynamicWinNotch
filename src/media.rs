@@ -1,0 +1,394 @@
+//! Now-playing data and transport control through Windows' Global System Media Transport
+//! Controls (GSMTC): the same API that drives the volume flyout and lock-screen media widget.
+//!
+//! A worker thread subscribes to the change events and sleeps on a channel otherwise, so it costs
+//! nothing while nothing happens. Results go into a mutex-protected snapshot and the UI thread is
+//! woken with a posted message.
+
+use crate::ffi::{CoInitializeEx, PostMessageW, HANDLE};
+use crate::gfx::resample_box;
+use crate::util::{accent_from_avg, avg_color_premul, crop_square_bgra_to_rgba, friendly_app};
+use crate::win::{filetime_now, WM_APP_MEDIA};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tiny_skia::Pixmap;
+use windows::core::Interface;
+use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
+use windows::Graphics::Imaging::{
+    BitmapAlphaMode, BitmapDecoder, BitmapInterpolationMode, BitmapPixelFormat, BitmapTransform, ColorManagementMode,
+    ExifOrientationMode,
+};
+use windows::Media::Control::{
+    GlobalSystemMediaTransportControlsSession as Session,
+    GlobalSystemMediaTransportControlsSessionManager as Manager,
+    GlobalSystemMediaTransportControlsSessionMediaProperties as MediaProps,
+    GlobalSystemMediaTransportControlsSessionPlaybackStatus as PbStatus,
+};
+use windows::Storage::Streams::IRandomAccessStream;
+
+/// Edge length of the album-art texture kept in RAM (64 KB).
+const ART_SIDE: u32 = 128;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MediaInfo {
+    pub has_session: bool,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    /// Friendly source app name ("Spotify", "Chrome", ...).
+    pub app: String,
+    pub playing: bool,
+    pub can_prev: bool,
+    pub can_next: bool,
+    pub can_toggle: bool,
+    pub can_seek: bool,
+    pub pos_ms: i64,
+    pub dur_ms: i64,
+    /// Bumps whenever the track (title/artist/album/app) changes.
+    pub track_id: u64,
+}
+
+pub struct Art {
+    /// Premultiplied RGBA, `side` x `side`.
+    pub rgba: Vec<u8>,
+    pub side: u32,
+    pub accent: (u8, u8, u8),
+}
+
+#[derive(Default)]
+pub struct Shared {
+    pub info: MediaInfo,
+    /// `None` = unchanged, `Some(None)` = clear the art, `Some(Some(a))` = new art.
+    pub art_update: Option<Option<Art>>,
+}
+
+pub enum Cmd {
+    TogglePlay,
+    Next,
+    Prev,
+    /// Absolute position in milliseconds.
+    Seek(i64),
+}
+
+pub enum Msg {
+    Refresh,
+    Cmd(Cmd),
+    Quit,
+}
+
+/// UI-thread copy of the media state.
+pub struct MediaView {
+    pub info: MediaInfo,
+    /// When `info.pos_ms` was captured, for extrapolating the progress bar.
+    pub at: Instant,
+    pub art: Option<Pixmap>,
+    pub accent: Option<(u8, u8, u8)>,
+}
+
+impl MediaView {
+    pub fn new() -> Self {
+        Self { info: MediaInfo::default(), at: Instant::now(), art: None, accent: None }
+    }
+
+    pub fn pos_ms(&self, now: Instant) -> i64 {
+        let mut p = self.info.pos_ms;
+        if self.info.playing {
+            p += now.saturating_duration_since(self.at).as_millis() as i64;
+        }
+        if self.info.dur_ms > 0 {
+            p = p.min(self.info.dur_ms);
+        }
+        p.max(0)
+    }
+}
+
+pub fn spawn(hwnd: HANDLE, want_art: bool) -> (Sender<Msg>, Arc<Mutex<Shared>>) {
+    let (tx, rx) = channel();
+    let shared = Arc::new(Mutex::new(Shared::default()));
+    let (tx2, sh2) = (tx.clone(), shared.clone());
+    let _ = std::thread::Builder::new()
+        .name("media".into())
+        .stack_size(1 << 20)
+        .spawn(move || run(hwnd, tx2, rx, sh2, want_art));
+    (tx, shared)
+}
+
+struct Bound {
+    session: Session,
+    t_props: EventRegistrationToken,
+    t_play: EventRegistrationToken,
+    t_time: EventRegistrationToken,
+}
+
+struct Worker {
+    manager: Manager,
+    tx: Sender<Msg>,
+    hwnd: HANDLE,
+    shared: Arc<Mutex<Shared>>,
+    want_art: bool,
+    bound: Option<Bound>,
+    last_key: String,
+    track_id: u64,
+    have_art: bool,
+    art_tries: u32,
+    playing: bool,
+}
+
+fn run(hwnd: HANDLE, tx: Sender<Msg>, rx: Receiver<Msg>, shared: Arc<Mutex<Shared>>, want_art: bool) {
+    unsafe { CoInitializeEx(std::ptr::null_mut(), 0) }; // COINIT_MULTITHREADED
+    let manager = match Manager::RequestAsync().and_then(|op| op.get()) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    {
+        let tx = tx.clone();
+        let _ = manager.CurrentSessionChanged(&TypedEventHandler::new(move |_, _| {
+            let _ = tx.send(Msg::Refresh);
+            Ok(())
+        }));
+    }
+    let mut w = Worker {
+        manager,
+        tx,
+        hwnd,
+        shared,
+        want_art,
+        bound: None,
+        last_key: String::new(),
+        track_id: 0,
+        have_art: false,
+        art_tries: 0,
+        playing: false,
+    };
+    w.refresh();
+    loop {
+        // Events wake us instantly; the timeout only re-syncs the position of a playing track.
+        let wait = if w.playing { Duration::from_secs(10) } else { Duration::from_secs(60) };
+        match rx.recv_timeout(wait) {
+            Ok(Msg::Quit) | Err(RecvTimeoutError::Disconnected) => break,
+            Ok(Msg::Cmd(c)) => {
+                w.command(c);
+                std::thread::sleep(Duration::from_millis(120)); // let the player apply it
+            }
+            Ok(Msg::Refresh) => std::thread::sleep(Duration::from_millis(40)), // coalesce event bursts
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        let mut quit = false;
+        while let Ok(m) = rx.try_recv() {
+            match m {
+                Msg::Cmd(c) => w.command(c),
+                Msg::Quit => quit = true,
+                Msg::Refresh => {}
+            }
+        }
+        if quit {
+            break;
+        }
+        w.refresh();
+    }
+}
+
+impl Worker {
+    fn command(&mut self, c: Cmd) {
+        let Ok(s) = self.manager.GetCurrentSession() else { return };
+        match c {
+            Cmd::TogglePlay => {
+                let _ = s.TryTogglePlayPauseAsync();
+            }
+            Cmd::Next => {
+                let _ = s.TrySkipNextAsync();
+            }
+            Cmd::Prev => {
+                let _ = s.TrySkipPreviousAsync();
+            }
+            Cmd::Seek(ms) => {
+                let start = s
+                    .GetTimelineProperties()
+                    .and_then(|t| t.StartTime())
+                    .map(|t| t.Duration)
+                    .unwrap_or(0);
+                let _ = s.TryChangePlaybackPositionAsync(start + ms.max(0) * 10_000);
+            }
+        }
+    }
+
+    /// Follow the current session: (re)subscribe to its change events when it changes.
+    fn rebind(&mut self, session: Option<&Session>) {
+        let same = match (&self.bound, session) {
+            (Some(b), Some(s)) => &b.session == s,
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        if let Some(b) = self.bound.take() {
+            let _ = b.session.RemoveMediaPropertiesChanged(b.t_props);
+            let _ = b.session.RemovePlaybackInfoChanged(b.t_play);
+            let _ = b.session.RemoveTimelinePropertiesChanged(b.t_time);
+        }
+        if let Some(s) = session {
+            let tx = self.tx.clone();
+            let t_props = s.MediaPropertiesChanged(&TypedEventHandler::new(move |_, _| {
+                let _ = tx.send(Msg::Refresh);
+                Ok(())
+            }));
+            let tx = self.tx.clone();
+            let t_play = s.PlaybackInfoChanged(&TypedEventHandler::new(move |_, _| {
+                let _ = tx.send(Msg::Refresh);
+                Ok(())
+            }));
+            let tx = self.tx.clone();
+            let t_time = s.TimelinePropertiesChanged(&TypedEventHandler::new(move |_, _| {
+                let _ = tx.send(Msg::Refresh);
+                Ok(())
+            }));
+            self.bound = Some(Bound {
+                session: s.clone(),
+                t_props: t_props.unwrap_or(EventRegistrationToken { Value: 0 }),
+                t_play: t_play.unwrap_or(EventRegistrationToken { Value: 0 }),
+                t_time: t_time.unwrap_or(EventRegistrationToken { Value: 0 }),
+            });
+            self.last_key.clear();
+            self.have_art = false;
+            self.art_tries = 0;
+        }
+    }
+
+    fn refresh(&mut self) {
+        let session = self.manager.GetCurrentSession().ok();
+        self.rebind(session.as_ref());
+        let mut info = MediaInfo::default();
+        let mut art_update: Option<Option<Art>> = None;
+        if let Some(s) = &session {
+            let _ = self.read(s, &mut info, &mut art_update);
+        } else if !self.last_key.is_empty() {
+            // The session went away: forget the track and drop its art.
+            self.last_key.clear();
+            self.have_art = false;
+            if self.want_art {
+                art_update = Some(None);
+            }
+        }
+        info.track_id = self.track_id;
+        self.playing = info.playing;
+        {
+            let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            g.info = info;
+            if art_update.is_some() {
+                g.art_update = art_update;
+            }
+        }
+        unsafe { PostMessageW(self.hwnd, WM_APP_MEDIA, 0, 0) };
+    }
+
+    fn read(&mut self, s: &Session, info: &mut MediaInfo, art_update: &mut Option<Option<Art>>) -> windows::core::Result<()> {
+        info.has_session = true;
+        info.app = friendly_app(&s.SourceAppUserModelId()?.to_string());
+
+        let pb = s.GetPlaybackInfo()?;
+        info.playing = pb.PlaybackStatus()? == PbStatus::Playing;
+        if let Ok(c) = pb.Controls() {
+            info.can_prev = c.IsPreviousEnabled().unwrap_or(false);
+            info.can_next = c.IsNextEnabled().unwrap_or(false);
+            info.can_toggle = c.IsPlayPauseToggleEnabled().unwrap_or(false)
+                || c.IsPlayEnabled().unwrap_or(false)
+                || c.IsPauseEnabled().unwrap_or(false);
+            info.can_seek = c.IsPlaybackPositionEnabled().unwrap_or(false);
+        }
+
+        if let Ok(props) = s.TryGetMediaPropertiesAsync().and_then(|op| op.get()) {
+            info.title = props.Title().map(|h| h.to_string()).unwrap_or_default();
+            info.artist = props.Artist().map(|h| h.to_string()).unwrap_or_default();
+            info.album = props.AlbumTitle().map(|h| h.to_string()).unwrap_or_default();
+
+            let key = format!("{}\u{1}{}\u{1}{}\u{1}{}", info.app, info.title, info.artist, info.album);
+            if key != self.last_key {
+                self.last_key = key;
+                self.track_id += 1;
+                self.have_art = false;
+                self.art_tries = 0;
+                if self.want_art {
+                    *art_update = Some(None); // never show the previous track's cover
+                }
+            }
+            // Players often publish the thumbnail a moment after the text: retry a few times.
+            if self.want_art && !self.have_art && self.art_tries < 3 {
+                self.art_tries += 1;
+                if let Some(a) = load_art(&props) {
+                    *art_update = Some(Some(a));
+                    self.have_art = true;
+                }
+            }
+        }
+
+        if let Ok(tl) = s.GetTimelineProperties() {
+            let start = tl.StartTime().map(|t| t.Duration).unwrap_or(0);
+            let end = tl.EndTime().map(|t| t.Duration).unwrap_or(0);
+            let pos = tl.Position().map(|t| t.Duration).unwrap_or(0);
+            let updated = tl.LastUpdatedTime().map(|t| t.UniversalTime).unwrap_or(0);
+            let dur_ms = (end - start).max(0) / 10_000;
+            let mut pos_ms = (pos - start).max(0) / 10_000;
+            if info.playing && updated > 0 {
+                // Position is as of LastUpdatedTime; bring it up to now.
+                pos_ms += (filetime_now() - updated).max(0) / 10_000;
+            }
+            if dur_ms > 0 {
+                pos_ms = pos_ms.min(dur_ms);
+            }
+            info.pos_ms = pos_ms;
+            info.dur_ms = dur_ms;
+        }
+        if info.dur_ms <= 0 {
+            info.can_seek = false;
+        }
+        Ok(())
+    }
+}
+
+/// Decode the session thumbnail with the Windows imaging stack (JPEG/PNG/WebP/...), scale it down
+/// in the decoder, centre-crop to a square and shrink to the art texture size.
+fn load_art(props: &MediaProps) -> Option<Art> {
+    let reference = props.Thumbnail().ok()?;
+    let stream = reference.OpenReadAsync().ok()?.get().ok()?;
+    let stream: IRandomAccessStream = stream.cast().ok()?;
+    let decoder = BitmapDecoder::CreateAsync(&stream).ok()?.get().ok()?;
+    let (w, h) = (decoder.PixelWidth().ok()?, decoder.PixelHeight().ok()?);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let short = w.min(h) as u64;
+    let (tw, th) = if short > 256 {
+        ((w as u64 * 256 / short) as u32, (h as u64 * 256 / short) as u32)
+    } else {
+        (w, h)
+    };
+    let tf = BitmapTransform::new().ok()?;
+    tf.SetScaledWidth(tw).ok()?;
+    tf.SetScaledHeight(th).ok()?;
+    tf.SetInterpolationMode(BitmapInterpolationMode::Fant).ok()?;
+    let provider = decoder
+        .GetPixelDataTransformedAsync(
+            BitmapPixelFormat::Bgra8,
+            BitmapAlphaMode::Premultiplied,
+            &tf,
+            ExifOrientationMode::IgnoreExifOrientation,
+            ColorManagementMode::DoNotColorManage,
+        )
+        .ok()?
+        .get()
+        .ok()?;
+    let bytes = provider.DetachPixelData().ok()?;
+    let raw: &[u8] = &bytes;
+    if raw.len() < (tw as usize) * (th as usize) * 4 {
+        return None;
+    }
+    let (square, side) = crop_square_bgra_to_rgba(raw, tw, th);
+    if side == 0 {
+        return None;
+    }
+    let rgba = resample_box(&square, side, side, ART_SIDE, ART_SIDE);
+    let (r, g, b) = avg_color_premul(&rgba);
+    Some(Art { rgba, side: ART_SIDE, accent: accent_from_avg(r, g, b) })
+}
