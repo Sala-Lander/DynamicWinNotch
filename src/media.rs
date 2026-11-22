@@ -74,6 +74,7 @@ pub enum Cmd {
 pub enum Msg {
     Refresh,
     Cmd(Cmd),
+    SetArt(bool),
     Quit,
 }
 
@@ -172,6 +173,13 @@ fn run(hwnd: HANDLE, tx: Sender<Msg>, rx: Receiver<Msg>, shared: Arc<Mutex<Share
                 std::thread::sleep(Duration::from_millis(120)); // let the player apply it
             }
             Ok(Msg::Refresh) => std::thread::sleep(Duration::from_millis(40)), // coalesce event bursts
+            Ok(Msg::SetArt(v)) => {
+                w.want_art = v;
+                if !v {
+                    let mut g = w.shared.lock().unwrap_or_else(|e| e.into_inner());
+                    g.art_update = Some(None);
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {}
         }
         let mut quit = false;
@@ -180,6 +188,13 @@ fn run(hwnd: HANDLE, tx: Sender<Msg>, rx: Receiver<Msg>, shared: Arc<Mutex<Share
                 Msg::Cmd(c) => w.command(c),
                 Msg::Quit => quit = true,
                 Msg::Refresh => {}
+                Msg::SetArt(v) => {
+                    w.want_art = v;
+                    if !v {
+                        let mut g = w.shared.lock().unwrap_or_else(|e| e.into_inner());
+                        g.art_update = Some(None);
+                    }
+                }
             }
         }
         if quit {

@@ -27,6 +27,14 @@ pub struct Config {
     pub fps_cap: u32,
     /// `None` = derive from album art.
     pub accent: Option<(u8, u8, u8)>,
+    /// Keep images from the clipboard (stored compressed, bounded by `image_budget_mb`).
+    pub clip_images: bool,
+    /// Memory budget for clipboard images, in MiB (compressed size).
+    pub image_budget_mb: u32,
+    /// Peek when the charger is plugged / unplugged and when the battery runs low.
+    pub power_alerts: bool,
+    /// Play the system notification sound when the timer ends.
+    pub timer_sound: bool,
 }
 
 impl Default for Config {
@@ -46,6 +54,10 @@ impl Default for Config {
             hide_fullscreen: true,
             fps_cap: 60,
             accent: None,
+            clip_images: true,
+            image_budget_mb: 64,
+            power_alerts: true,
+            timer_sound: true,
         }
     }
 }
@@ -97,6 +109,10 @@ pub fn parse(text: &str) -> Config {
             "hide_fullscreen" => c.hide_fullscreen = truthy(v),
             "fps_cap" => c.fps_cap = v.parse::<u32>().unwrap_or(c.fps_cap).clamp(15, 240),
             "accent" => c.accent = if v.eq_ignore_ascii_case("auto") { None } else { parse_hex(v) },
+            "clip_images" => c.clip_images = truthy(v),
+            "image_budget_mb" => c.image_budget_mb = v.parse::<u32>().unwrap_or(c.image_budget_mb).clamp(8, 512),
+            "power_alerts" => c.power_alerts = truthy(v),
+            "timer_sound" => c.timer_sound = truthy(v),
             _ => {}
         }
     }
@@ -115,63 +131,119 @@ pub fn load() -> Config {
         .unwrap_or_default()
 }
 
-pub const TEMPLATE: &str = "\
+fn b(v: bool) -> u8 {
+    v as u8
+}
+
+/// The config file as text, with comments. Used for the first-run file and whenever the
+/// Settings tab saves, so the file on disk always documents every key.
+pub fn render(c: &Config) -> String {
+    let accent = match c.accent {
+        Some((r, g, bl)) => format!("#{r:02X}{g:02X}{bl:02X}"),
+        None => "auto".to_string(),
+    };
+    format!(
+        "\
 # Notch Island settings. Lines starting with # are comments.
-# Use the tray menu -> \"Reload config\" after editing.
+# Most of these can also be changed in the Settings tab; use the tray menu -> \"Reload config\"
+# after editing this file by hand.
 
 # hover = expands when the pointer touches the notch, click = expands on click.
-expand_on = hover
+expand_on = {expand}
 
 # notch  = fused to the top edge with concave ears (like a hardware notch)
 # island = floating pill, a few pixels below the top edge
-style = notch
+style = {style}
 
-# Tab shown first: media | clipboard | system
-start_tab = media
+# Tab shown first: media | clipboard | system | timer | settings
+start_tab = {tab}
 
 # Milliseconds the pointer must rest on the notch before it expands (hover mode).
-hover_delay_ms = 80
+hover_delay_ms = {hover}
 
 # Milliseconds after the pointer leaves before the island collapses.
-collapse_delay_ms = 450
+collapse_delay_ms = {collapse}
 
 # Clipboard entries kept in memory (pinned entries do not count). History is never written to disk.
-history_size = 30
+history_size = {history}
+
+# Keep images copied to the clipboard (1/0). Stored compressed, in memory only.
+clip_images = {images}
+
+# Memory budget for clipboard images in MiB (8-512, compressed size). Oldest unpinned images go first.
+image_budget_mb = {budget}
 
 # Fetch and show album art (1/0).
-album_art = 1
+album_art = {art}
 
 # Animated equalizer bars in the collapsed pill while media is playing (1/0).
 # Costs a few redraws per second only while music plays.
-equalizer = 1
+equalizer = {eq}
 
-# Briefly widen the pill on track change and on new clipboard text (1/0).
-auto_peek = 1
+# Briefly widen the pill on track change and on new clipboard content (1/0).
+auto_peek = {peek}
+
+# Peek when the charger is plugged in / removed and when the battery is low (1/0).
+power_alerts = {power}
+
+# Play the system sound when the timer ends (1/0).
+timer_sound = {sound}
 
 # Skip clipboard content that password managers flag as sensitive (1/0).
-privacy_filter = 1
+privacy_filter = {privacy}
 
 # Ctrl+Alt+N toggles the island pinned open (1/0).
-hotkey = 1
+hotkey = {hotkey}
 
 # Hide the island while a full-screen app, game or presentation is running (1/0).
-hide_fullscreen = 1
+hide_fullscreen = {hide}
 
 # Animation frame cap (15-240). The loop is vsync-paced, so this only limits very high refresh rates.
-fps_cap = 60
+fps_cap = {fps}
 
 # auto = taken from the album art, or a fixed colour such as #7AA8FF
-accent = auto
-";
+accent = {accent}
+",
+        expand = if c.expand_on == ExpandOn::Click { "click" } else { "hover" },
+        style = if c.style == Style::Island { "island" } else { "notch" },
+        tab = c.start_tab.label().to_ascii_lowercase(),
+        hover = c.hover_delay_ms,
+        collapse = c.collapse_delay_ms,
+        history = c.history_size,
+        images = b(c.clip_images),
+        budget = c.image_budget_mb,
+        art = b(c.album_art),
+        eq = b(c.equalizer),
+        peek = b(c.auto_peek),
+        power = b(c.power_alerts),
+        sound = b(c.timer_sound),
+        privacy = b(c.privacy_filter),
+        hotkey = b(c.hotkey),
+        hide = b(c.hide_fullscreen),
+        fps = c.fps_cap,
+        accent = accent,
+    )
+}
 
-/// Write the template if there is no config yet; returns the file path.
+/// Write the default file if there is no config yet; returns the file path.
 pub fn ensure_template() -> Option<PathBuf> {
     let p = path()?;
     if !p.exists() {
         std::fs::create_dir_all(p.parent()?).ok()?;
-        std::fs::write(&p, TEMPLATE).ok()?;
+        std::fs::write(&p, render(&Config::default())).ok()?;
     }
     Some(p)
+}
+
+/// Persist the settings (called by the Settings tab after a change).
+pub fn save(c: &Config) -> bool {
+    let Some(p) = path() else { return false };
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Write beside the file and rename, so a crash cannot leave a half-written config.
+    let tmp = p.with_extension("ini.tmp");
+    std::fs::write(&tmp, render(c)).is_ok() && std::fs::rename(&tmp, &p).is_ok()
 }
 
 #[cfg(test)]
@@ -184,8 +256,42 @@ mod tests {
     }
 
     #[test]
-    fn template_parses_to_defaults() {
-        assert_eq!(parse(TEMPLATE), Config::default());
+    fn default_file_parses_to_defaults() {
+        assert_eq!(parse(&render(&Config::default())), Config::default());
+    }
+
+    #[test]
+    fn render_round_trips_every_field() {
+        let c = Config {
+            expand_on: ExpandOn::Click,
+            style: Style::Island,
+            start_tab: Tab::Settings,
+            hover_delay_ms: 140,
+            collapse_delay_ms: 900,
+            history_size: 70,
+            album_art: false,
+            equalizer: false,
+            auto_peek: false,
+            privacy_filter: false,
+            hotkey: false,
+            hide_fullscreen: false,
+            fps_cap: 120,
+            accent: Some((1, 2, 250)),
+            clip_images: false,
+            image_budget_mb: 200,
+            power_alerts: false,
+            timer_sound: false,
+        };
+        assert_eq!(parse(&render(&c)), c);
+    }
+
+    #[test]
+    fn new_keys_parse_and_clamp() {
+        let c = parse("clip_images = 0\nimage_budget_mb = 1\npower_alerts = no\ntimer_sound = off\nstart_tab = timer");
+        assert!(!c.clip_images && !c.power_alerts && !c.timer_sound);
+        assert_eq!(c.image_budget_mb, 8);
+        assert_eq!(c.start_tab, Tab::Timer);
+        assert_eq!(parse("image_budget_mb = 99999").image_budget_mb, 512);
     }
 
     #[test]

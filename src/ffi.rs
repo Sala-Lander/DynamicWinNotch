@@ -200,6 +200,10 @@ pub const WM_MOUSEHWHEEL: u32 = 0x020E;
 pub const WM_DPICHANGED: u32 = 0x02E0;
 pub const WM_DISPLAYCHANGE: u32 = 0x007E;
 pub const WM_HOTKEY: u32 = 0x0312;
+pub const WM_POWERBROADCAST: u32 = 0x0218;
+pub const PBT_APMPOWERSTATUSCHANGE: usize = 0x000A;
+pub const CF_HDROP: u32 = 15;
+pub const MB_ICONASTERISK: u32 = 0x40;
 pub const WM_CLIPBOARDUPDATE: u32 = 0x031D;
 pub const WM_APP: u32 = 0x8000;
 
@@ -304,6 +308,10 @@ extern "system" {
     pub fn IsClipboardFormatAvailable(format: u32) -> i32;
     pub fn GetClipboardSequenceNumber() -> u32;
     pub fn RegisterClipboardFormatW(name: *const u16) -> u32;
+    pub fn OpenClipboard(hwnd: HANDLE) -> i32;
+    pub fn CloseClipboard() -> i32;
+    pub fn GetClipboardData(format: u32) -> HANDLE;
+    pub fn MessageBeep(kind: u32) -> i32;
     pub fn GetDpiForSystem() -> u32;
     pub fn GetDpiForWindow(hwnd: HANDLE) -> u32;
     pub fn SetProcessDpiAwarenessContext(ctx: isize) -> i32;
@@ -343,6 +351,7 @@ extern "system" {
 extern "system" {
     pub fn Shell_NotifyIconW(msg: u32, data: *mut NOTIFYICONDATAW) -> i32;
     pub fn SHQueryUserNotificationState(state: *mut i32) -> i32;
+    pub fn DragQueryFileW(hdrop: HANDLE, index: u32, buf: *mut u16, cch: u32) -> u32;
     pub fn ShellExecuteW(
         hwnd: HANDLE,
         verb: *const u16,

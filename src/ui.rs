@@ -4,14 +4,16 @@
 //! source the hit-testing uses, so drawing and clicking can never disagree.
 
 use crate::config::Config;
-use crate::gfx::{self, rgba, Canvas, Weight};
-use crate::history::History;
-use crate::layout::{Geo, Hit, Rect, Style, Tab, ROW_H, VISIBLE_ROWS};
+use crate::gfx::{self, pixmap_from_rgba, rgba, Canvas, Weight};
+use crate::history::{History, Kind};
+use crate::layout::{settings_ctl_right, Geo, Hit, Rect, Style, Tab, ROW_H, TAB_COUNT, TIMER_PRESETS, VISIBLE_ROWS};
 use crate::media::MediaView;
+use crate::settings::{self, Ctl};
 use crate::sys::Stats;
+use crate::timer::fmt_clock;
 use crate::util::{fmt_time, lerp, marquee_offset, smoothstep};
 use std::f32::consts::{FRAC_PI_2, TAU};
-use tiny_skia::Color;
+use tiny_skia::{Color, Pixmap};
 
 const WHITE: (u8, u8, u8) = (255, 255, 255);
 
@@ -19,14 +21,47 @@ const WHITE: (u8, u8, u8) = (255, 255, 255);
 pub enum PeekKind {
     Track,
     Clip,
+    Timer,
+    Power(PowerIcon),
 }
 
-/// Text shown in the widened "peek" pill (new track / new clipboard text).
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PowerIcon {
+    Plugged,
+    Unplugged,
+    Low,
+    Full,
+}
+
+/// Text shown in the widened "peek" pill (new track / new clipboard item / timer / power).
+#[derive(Clone)]
 pub struct PeekInfo {
     pub kind: PeekKind,
     pub line1: String,
     pub line2: String,
+    /// Clipboard image thumbnail.
+    pub thumb: Option<Pixmap>,
+    /// Clipboard colour swatch.
+    pub color: Option<(u8, u8, u8)>,
+    /// Battery level 0..=1 for power peeks.
+    pub level: Option<f32>,
+}
+
+impl PeekInfo {
+    pub fn new(kind: PeekKind, line1: String, line2: String) -> Self {
+        Self { kind, line1, line2, thumb: None, color: None, level: None }
+    }
+}
+
+/// What the timer looks like right now (computed by the app from `timer::Timer`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TimerView {
+    pub running: bool,
+    pub finished: bool,
+    pub secs: u64,
+    /// 1.0 = full, 0.0 = done.
+    pub frac: f32,
+    pub total_min: u32,
 }
 
 pub struct Scene<'a> {
@@ -49,6 +84,12 @@ pub struct Scene<'a> {
     pub clip: &'a History,
     /// Clipboard scroll position in rows.
     pub scroll: f32,
+    /// Settings scroll position in rows.
+    pub sscroll: f32,
+    pub autostart: bool,
+    /// 1 -> 0 fade of the "Saved" note after a settings change.
+    pub saved: f32,
+    pub timer: TimerView,
     /// (row index, 0..1 intensity) of the row that was just copied.
     pub flash: Option<(usize, f32)>,
     /// Displayed (spring-smoothed) CPU / RAM / battery fractions.
@@ -119,12 +160,32 @@ fn draw_compact(cv: &mut Canvas, sc: &Scene, a: f32) {
     let ca = a * (1.0 - sc.peek_mix);
     let pa = a * sc.peek_mix;
 
-    if ca > 0.01 && show_media {
+    if ca > 0.01 {
         let cy = p.cy();
-        if let Some(img) = &sc.media.art {
-            cv.draw_image(img, Rect::new(p.x + 11.0, cy - 10.0, 20.0, 20.0), 6.0, ca);
+        // Running timer: a small ring and the remaining time. It sits on the right next to the
+        // equalizer, or in the middle when nothing is playing.
+        let mut eq_right = p.right() - 14.0;
+        if sc.timer.running {
+            let txt = fmt_clock(sc.timer.secs);
+            let tw = cv.text_width(&txt, 12.0, Weight::Semibold);
+            let (ring_cx, text_x) = if show_media {
+                let tx = p.right() - 12.0 - tw;
+                eq_right = tx - 18.0 - 12.0;
+                (tx - 11.0, tx)
+            } else {
+                let gw = 12.0 + 6.0 + tw;
+                let x0 = p.cx() - gw * 0.5;
+                (x0 + 6.0, x0 + 18.0)
+            };
+            draw_ring(cv, ring_cx, cy, 5.5, 2.2, sc.timer.frac, sc.accent, ca);
+            cv.text(&txt, text_x, cy + 4.3, 12.0, Weight::Semibold, WHITE, ca);
         }
-        draw_eq(cv, p.right() - 14.0, cy, m.playing, sc.now, sc.accent, ca);
+        if show_media {
+            if let Some(img) = &sc.media.art {
+                cv.draw_image(img, Rect::new(p.x + 11.0, cy - 10.0, 20.0, 20.0), 6.0, ca);
+            }
+            draw_eq(cv, eq_right, cy, m.playing, sc.now, sc.accent, ca);
+        }
     }
     if pa > 0.01 {
         if let Some(pk) = sc.peek {
@@ -133,27 +194,59 @@ fn draw_compact(cv: &mut Canvas, sc: &Scene, a: f32) {
     }
 }
 
+/// Draw a pre-sized image inside `area`, keeping its aspect ratio.
+fn draw_thumb(cv: &mut Canvas, px: &Pixmap, area: Rect, radius: f32, a: f32) {
+    let (iw, ih) = (px.width() as f32, px.height() as f32);
+    let s = (area.w / iw).min(area.h / ih);
+    let (w, h) = (iw * s, ih * s);
+    let r = Rect::new(area.cx() - w * 0.5, area.cy() - h * 0.5, w, h);
+    cv.draw_image(px, r, radius.min(w * 0.5).min(h * 0.5), a);
+}
+
+/// Circular progress: a faint full track plus an arc of `frac` of the circle from 12 o'clock.
+fn draw_ring(cv: &mut Canvas, cx: f32, cy: f32, r: f32, width: f32, frac: f32, color: (u8, u8, u8), a: f32) {
+    if let Some(track) = gfx::circle(cx, cy, r) {
+        cv.stroke(&track, width, white(0.14 * a), false);
+    }
+    let f = frac.clamp(0.0, 1.0);
+    if f > 0.004 {
+        if let Some(arc) = gfx::arc_path(cx, cy, r, -FRAC_PI_2, TAU * f.min(0.9999)) {
+            cv.stroke(&arc, width, rgba(color, a), true);
+        }
+    }
+}
+
 fn draw_peek(cv: &mut Canvas, sc: &Scene, pk: &PeekInfo, a: f32) {
     let p = sc.pill;
     let cy = p.cy();
     let mut x = p.x + 10.0;
+    let cell = Rect::new(x, cy - 15.0, 30.0, 30.0);
     match pk.kind {
-        PeekKind::Track => {
-            let r = Rect::new(x, cy - 15.0, 30.0, 30.0);
-            match &sc.media.art {
-                Some(img) => cv.draw_image(img, r, 8.0, a),
-                None => {
-                    cv.fill_rrect(r, 8.0, white(0.10 * a));
-                    draw_note(cv, r.cx(), r.cy(), 0.55, 0.40 * a);
-                }
+        PeekKind::Track => match &sc.media.art {
+            Some(img) => cv.draw_image(img, cell, 8.0, a),
+            None => {
+                cv.fill_rrect(cell, 8.0, white(0.10 * a));
+                draw_note(cv, cell.cx(), cell.cy(), 0.55, 0.40 * a);
             }
-            x += 40.0;
-        }
+        },
         PeekKind::Clip => {
-            draw_clip_icon(cv, x + 15.0, cy, a, sc.accent);
-            x += 40.0;
+            if let Some(px) = &pk.thumb {
+                cv.fill_rrect(cell, 8.0, white(0.08 * a));
+                draw_thumb(cv, px, cell, 6.0, a);
+            } else if let Some(c) = pk.color {
+                cv.fill_rrect(cell.inflate(0.8), 9.0, white(0.18 * a));
+                cv.fill_rrect(cell, 8.0, rgba(c, a));
+            } else {
+                draw_clip_icon(cv, cell.cx(), cy, a, sc.accent);
+            }
         }
+        PeekKind::Timer => {
+            draw_ring(cv, cell.cx(), cy, 11.0, 3.0, 1.0, sc.accent, a);
+            cv.fill_circle(cell.cx(), cy, 3.2, white(a));
+        }
+        PeekKind::Power(icon) => draw_power_icon(cv, cell.cx(), cy, icon, pk.level.unwrap_or(1.0), a),
     }
+    x += 40.0;
     let right_pad = if pk.kind == PeekKind::Track { 38.0 } else { 14.0 };
     let w = (p.right() - right_pad - x).max(20.0);
     let l1 = cv.fit(&pk.line1, 13.0, Weight::Semibold, w);
@@ -162,6 +255,35 @@ fn draw_peek(cv: &mut Canvas, sc: &Scene, pk: &PeekInfo, a: f32) {
     cv.text(&l2, x, cy + 12.0, 11.0, Weight::Regular, WHITE, 0.55 * a);
     if pk.kind == PeekKind::Track {
         draw_eq(cv, p.right() - 14.0, cy, sc.media.info.playing, sc.now, sc.accent, a);
+    }
+}
+
+/// Battery outline with a level bar; a bolt for "plugged in".
+fn draw_power_icon(cv: &mut Canvas, cx: f32, cy: f32, icon: PowerIcon, level: f32, a: f32) {
+    let pct = (level.clamp(0.0, 1.0) * 100.0).round() as u8;
+    let charging = matches!(icon, PowerIcon::Plugged | PowerIcon::Full);
+    let col = battery_color(pct, charging);
+    let body = Rect::new(cx - 13.0, cy - 7.0, 24.0, 14.0);
+    if let Some(path) = gfx::rrect(body, 4.0) {
+        cv.stroke(&path, 1.5, white(0.75 * a), false);
+    }
+    cv.fill_rrect(Rect::new(body.right() + 1.5, cy - 2.5, 2.2, 5.0), 1.0, white(0.6 * a));
+    let fill_w = ((body.w - 5.0) * level.clamp(0.0, 1.0)).max(2.0);
+    cv.fill_rrect(Rect::new(body.x + 2.5, body.y + 2.5, fill_w, body.h - 5.0), 2.0, rgba(col, a));
+    if charging {
+        let s = 5.5;
+        tri(
+            cv,
+            &[
+                (cx - 1.0 + 0.4 * s, cy - 1.0 * s),
+                (cx - 1.0 - 0.6 * s, cy + 0.15 * s),
+                (cx - 1.0 - 0.05 * s, cy + 0.15 * s),
+                (cx - 1.0 - 0.35 * s, cy + 1.0 * s),
+                (cx - 1.0 + 0.65 * s, cy - 0.25 * s),
+                (cx - 1.0 + 0.1 * s, cy - 0.25 * s),
+            ],
+            rgba((0, 0, 0), 0.85 * a),
+        );
     }
 }
 
@@ -186,30 +308,36 @@ fn draw_eq(cv: &mut Canvas, right: f32, cy: f32, playing: bool, t: f32, color: (
 // ----------------------------------------------------------------- expanded
 fn draw_expanded(cv: &mut Canvas, sc: &Scene, a: f32) -> bool {
     let g = sc.geo;
+    let last = (TAB_COUNT - 1) as f32;
 
     // Sliding tab highlight + labels.
     let step = g.tabs[1].x - g.tabs[0].x;
-    let hx = g.tabs[0].x + sc.tab_pos.clamp(0.0, 2.0) * step;
+    let hx = g.tabs[0].x + sc.tab_pos.clamp(0.0, last) * step;
     cv.fill_rrect(Rect::new(hx, g.tabs[0].y, g.tabs[0].w, g.tabs[0].h), 12.0, white(0.13 * a));
     for (i, tab) in Tab::ALL.iter().enumerate() {
         let r = g.tabs[i];
         let act = 1.0 - (sc.tab_pos - i as f32).abs().min(1.0);
         let hov = if matches!(sc.hover, Hit::Tab(j) if j == i) { 1.0 } else { 0.0 };
         let alpha = (0.45 + 0.55 * act + 0.25 * hov * (1.0 - act)).min(1.0) * a;
-        cv.text_centered(tab.label(), r.cx(), r.y + 16.5, 12.0, Weight::Semibold, WHITE, alpha);
+        cv.text_centered(tab.short(), r.cx(), r.y + 16.0, 11.5, Weight::Semibold, WHITE, alpha);
     }
 
     draw_pin(cv, g.pin, sc.pinned, sc.hover == Hit::Pin, sc.accent, a);
 
+    // Left slot of the header: "Clear" on the clipboard tab, "Saved" after a settings change.
     let clip_vis = 1.0 - (sc.tab_pos - 1.0).abs().min(1.0);
     if clip_vis > 0.01 && !sc.clip.is_empty() {
         let al = if sc.hover == Hit::Clear { 0.9 } else { 0.5 };
         cv.text("Clear", g.clear.x + 4.0, g.clear.y + 16.0, 11.5, Weight::Semibold, WHITE, al * clip_vis * a);
     }
+    let set_vis = 1.0 - (sc.tab_pos - 4.0).abs().min(1.0);
+    if set_vis > 0.01 && sc.saved > 0.01 {
+        cv.text("Saved", g.clear.x + 4.0, g.clear.y + 16.0, 11.5, Weight::Semibold, sc.accent, sc.saved * set_vis * a);
+    }
 
     // Pages: neighbours slide and cross-fade while the highlight moves.
     let mut marquee = false;
-    for i in 0..3 {
+    for i in 0..TAB_COUNT {
         let d = i as f32 - sc.tab_pos;
         if d.abs() >= 1.0 {
             continue;
@@ -219,7 +347,9 @@ fn draw_expanded(cv: &mut Canvas, sc: &Scene, a: f32) -> bool {
         match i {
             0 => marquee = page_media(cv, sc, ox, pa),
             1 => page_clip(cv, sc, ox, pa),
-            _ => page_system(cv, sc, ox, pa),
+            2 => page_system(cv, sc, ox, pa),
+            3 => page_timer(cv, sc, ox, pa),
+            _ => page_settings(cv, sc, ox, pa),
         }
     }
     marquee
@@ -312,6 +442,48 @@ fn page_media(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) -> bool {
 }
 
 // ---------------------------------------------------------------- clipboard
+/// Leading icon of a clipboard row, inside `cell` (30 x 20).
+fn draw_kind_icon(cv: &mut Canvas, e: &crate::history::Entry, cell: Rect, a: f32) {
+    let (cx, cy) = (cell.cx(), cell.cy());
+    match e.kind {
+        Kind::Image => {
+            cv.fill_rrect(cell, 5.0, white(0.07 * a));
+            if let Some(img) = &e.image {
+                if let Some(px) = pixmap_from_rgba(img.thumb.clone(), img.thumb_w, img.thumb_h) {
+                    draw_thumb(cv, &px, cell, 4.0, a);
+                }
+            }
+        }
+        Kind::Color(c) => {
+            let sw = Rect::new(cx - 10.0, cy - 10.0, 20.0, 20.0);
+            cv.fill_rrect(sw.inflate(0.8), 6.5, white(0.20 * a));
+            cv.fill_rrect(sw, 6.0, rgba(c, a));
+        }
+        Kind::Link(_) => {
+            // Globe: outline, equator and meridian.
+            let col = rgba((120, 190, 255), 0.95 * a);
+            if let Some(c) = gfx::circle(cx, cy, 7.0) {
+                cv.stroke(&c, 1.4, col, false);
+            }
+            cv.fill_rrect(Rect::new(cx - 7.0, cy - 0.6, 14.0, 1.2), 0.6, col);
+            cv.fill_rrect(Rect::new(cx - 0.6, cy - 7.0, 1.2, 14.0), 0.6, col);
+            if let Some(c) = gfx::circle(cx, cy, 3.2) {
+                cv.stroke(&c, 1.0, col, false);
+            }
+        }
+        Kind::Files(_) => {
+            let col = rgba((255, 204, 90), 0.95 * a);
+            cv.fill_rrect(Rect::new(cx - 9.0, cy - 6.5, 7.0, 4.0), 1.5, col);
+            cv.fill_rrect(Rect::new(cx - 9.0, cy - 4.5, 18.0, 11.5), 2.5, col);
+        }
+        Kind::Text => {
+            for (k, w) in [12.0f32, 9.0, 11.0].iter().enumerate() {
+                cv.fill_rrect(Rect::new(cx - 6.0, cy - 5.5 + k as f32 * 4.4, *w, 1.6), 0.8, white(0.45 * a));
+            }
+        }
+    }
+}
+
 fn page_clip(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
     let g = sc.geo;
     let c = g.content;
@@ -321,7 +493,7 @@ fn page_clip(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
         let cx = c.cx() + ox;
         draw_clip_icon(cv, cx, c.y + 34.0, 0.30 * a, sc.accent);
         cv.text_centered("Nothing copied yet", cx, c.y + 72.0, 14.0, Weight::Semibold, WHITE, 0.85 * a);
-        cv.text_centered("Text you copy shows up here", cx, c.y + 90.0, 11.5, Weight::Regular, WHITE, 0.45 * a);
+        cv.text_centered("Text, links, colours, files and images show up here", cx, c.y + 90.0, 11.5, Weight::Regular, WHITE, 0.45 * a);
         return;
     }
 
@@ -343,13 +515,39 @@ fn page_clip(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
         if flash > 0.0 {
             cv.fill_rrect(row, 9.0, rgba(sc.accent, 0.28 * flash * a));
         }
-        let mut tx = row.x + 12.0;
         if e.pinned {
-            cv.fill_circle(row.x + 11.0, row.cy(), 3.0, rgba(sc.accent, a));
-            tx += 11.0;
+            cv.fill_circle(row.x + 6.0, row.cy(), 2.3, rgba(sc.accent, a));
         }
-        let txt = cv.fit(&e.preview, 12.5, Weight::Regular, row.w - (tx - row.x) - 64.0);
-        cv.text(&txt, tx, row.y + 16.5, 12.5, Weight::Regular, WHITE, 0.88 * a);
+        draw_kind_icon(cv, e, Rect::new(row.x + 12.0, row.y + 2.0, 30.0, row.h - 4.0), a);
+
+        let tx = row.x + 12.0 + 30.0 + 8.0;
+        let avail = row.w - (tx - row.x) - 64.0;
+        let ty = row.y + 16.5;
+        match e.kind {
+            Kind::Link(hl) => {
+                // Host in full strength, path and query dimmed.
+                let hl = if e.preview.is_char_boundary(hl) { hl } else { e.preview.len() };
+                let (host, rest) = e.preview.split_at(hl);
+                let host = cv.fit(host, 12.5, Weight::Semibold, avail);
+                let hw = cv.text_width(&host, 12.5, Weight::Semibold);
+                cv.text(&host, tx, ty, 12.5, Weight::Semibold, WHITE, 0.92 * a);
+                if avail - hw > 12.0 && !rest.is_empty() {
+                    let rest = cv.fit(rest, 12.5, Weight::Regular, avail - hw);
+                    cv.text(&rest, tx + hw, ty, 12.5, Weight::Regular, WHITE, 0.45 * a);
+                }
+            }
+            Kind::Color((r, gr, b)) => {
+                let hex = format!("#{r:02X}{gr:02X}{b:02X}");
+                let hw = cv.text_width(&hex, 12.5, Weight::Semibold);
+                cv.text(&hex, tx, ty, 12.5, Weight::Semibold, WHITE, 0.92 * a);
+                let rgb = format!("rgb({r}, {gr}, {b})");
+                cv.text(&rgb, tx + hw + 10.0, ty, 11.5, Weight::Regular, WHITE, 0.45 * a);
+            }
+            _ => {
+                let txt = cv.fit(&e.preview, 12.5, Weight::Regular, avail);
+                cv.text(&txt, tx, ty, 12.5, Weight::Regular, WHITE, 0.88 * a);
+            }
+        }
 
         let label: Option<(&str, (u8, u8, u8), f32)> = if flash > 0.05 {
             Some(("Copied", sc.accent, flash.min(1.0) * a))
@@ -365,11 +563,15 @@ fn page_clip(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
     }
     cv.unclip_rect();
 
-    // Scroll thumb.
-    if items.len() > VISIBLE_ROWS {
-        let max_scroll = (items.len() - VISIBLE_ROWS) as f32;
-        let th = (c.h * VISIBLE_ROWS as f32 / items.len() as f32).max(16.0);
-        let ty = c.y + (c.h - th) * (sc.scroll / max_scroll).clamp(0.0, 1.0);
+    scroll_thumb(cv, c, items.len(), sc.scroll, ox, a);
+}
+
+/// Thin scroll indicator to the right of a list page.
+fn scroll_thumb(cv: &mut Canvas, c: Rect, total: usize, scroll: f32, ox: f32, a: f32) {
+    if total > VISIBLE_ROWS {
+        let max_scroll = (total - VISIBLE_ROWS) as f32;
+        let th = (c.h * VISIBLE_ROWS as f32 / total as f32).max(16.0);
+        let ty = c.y + (c.h - th) * (scroll / max_scroll).clamp(0.0, 1.0);
         cv.fill_rrect(Rect::new(c.right() + 6.0 + ox, ty, 3.0, th), 1.5, white(0.22 * a));
     }
 }
@@ -443,6 +645,169 @@ fn page_system(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
         cv.text_centered(label, cx, cy + r + 21.0, 12.0, Weight::Semibold, WHITE, 0.9 * a);
         cv.text_centered(sub, cx, cy + r + 36.0, 10.5, Weight::Regular, WHITE, 0.45 * a);
     }
+}
+
+// -------------------------------------------------------------------- timer
+fn pill_button(cv: &mut Canvas, r: Rect, label: &str, hover: bool, primary: bool, a: f32) {
+    if primary {
+        cv.fill_rrect(r, r.h * 0.5, white((if hover { 1.0 } else { 0.92 }) * a));
+        cv.text_centered(label, r.cx(), r.y + r.h * 0.5 + 4.5, 12.5, Weight::Semibold, (0, 0, 0), a);
+    } else {
+        cv.fill_rrect(r, r.h * 0.5, white((if hover { 0.18 } else { 0.09 }) * a));
+        cv.text_centered(label, r.cx(), r.y + r.h * 0.5 + 4.5, 12.0, Weight::Semibold, WHITE, 0.9 * a);
+    }
+}
+
+fn page_timer(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
+    let g = sc.geo;
+    let t = &sc.timer;
+    let ring = g.t_ring;
+    let (cx, cy) = (ring.cx() + ox, ring.cy());
+    let color = if t.finished { (255, 159, 10) } else { sc.accent };
+    let hov_ring = sc.hover == Hit::TimerToggle;
+    draw_ring(cv, cx, cy, 40.0, 7.0, if t.finished { 1.0 } else { t.frac }, color, a);
+    if hov_ring {
+        cv.fill_circle(cx, cy, 33.0, white(0.05 * a));
+    }
+    let clock = fmt_clock(t.secs);
+    let size = if t.secs >= 3600 { 16.0 } else { 21.0 };
+    cv.text_centered(&clock, cx, cy + 4.0, size, Weight::Semibold, WHITE, a);
+    let state = if t.finished {
+        "Time is up"
+    } else if t.running {
+        "Running"
+    } else if t.frac < 0.999 {
+        "Paused"
+    } else {
+        "Ready"
+    };
+    cv.text_centered(state, cx, cy + 22.0, 10.5, Weight::Regular, WHITE, 0.5 * a);
+
+    // Preset chips.
+    for (i, m) in TIMER_PRESETS.iter().enumerate() {
+        let r = g.t_presets[i];
+        let r = Rect::new(r.x + ox, r.y, r.w, r.h);
+        let hov = sc.hover == Hit::Preset(i);
+        let sel = t.total_min == *m;
+        if sel {
+            cv.fill_rrect(r, 13.0, rgba(sc.accent, 0.25 * a));
+        } else {
+            cv.fill_rrect(r, 13.0, white((if hov { 0.16 } else { 0.08 }) * a));
+        }
+        let al = if sel || hov { 1.0 } else { 0.75 };
+        cv.text_centered(&format!("{m}m"), r.cx(), r.y + 17.5, 12.0, Weight::Semibold, WHITE, al * a);
+    }
+
+    // Transport buttons.
+    let off = |r: Rect| Rect::new(r.x + ox, r.y, r.w, r.h);
+    pill_button(cv, off(g.t_minus), "-1m", sc.hover == Hit::TimerMinus, false, a);
+    let label = if t.finished {
+        "Restart"
+    } else if t.running {
+        "Pause"
+    } else if t.frac < 0.999 {
+        "Resume"
+    } else {
+        "Start"
+    };
+    pill_button(cv, off(g.t_toggle), label, sc.hover == Hit::TimerToggle, true, a);
+    pill_button(cv, off(g.t_plus), "+1m", sc.hover == Hit::TimerPlus, false, a);
+    pill_button(cv, off(g.t_reset), "Reset", sc.hover == Hit::TimerReset, false, a);
+    cv.text("Scroll to change the time", g.t_presets[0].x + ox, g.content.y + 104.0, 10.5, Weight::Regular, WHITE, 0.32 * a);
+}
+
+// ----------------------------------------------------------------- settings
+fn page_settings(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
+    let g = sc.geo;
+    let c = g.content;
+    let view = settings::View { cfg: sc.cfg, autostart: sc.autostart };
+    let right = settings_ctl_right(c) + ox;
+
+    cv.clip_rect(Rect::new(c.x - 8.0, c.y, c.w + 16.0, c.h));
+    let first = sc.sscroll.floor().max(0.0) as usize;
+    let last = (first + VISIBLE_ROWS + 1).min(settings::ROWS.len());
+    for i in first..last {
+        let row = &settings::ROWS[i];
+        let y = c.y + (i as f32 - sc.sscroll) * ROW_H;
+        let hov_row = matches!(sc.hover, Hit::Set(j, _) if j == i);
+        if hov_row && row.ctl == Ctl::Toggle {
+            cv.fill_rrect(Rect::new(c.x + ox, y + 2.0, c.w, ROW_H - 4.0), 9.0, white(0.06 * a));
+        }
+        cv.text(row.label, c.x + ox + 8.0, y + 18.5, 12.5, Weight::Regular, WHITE, 0.88 * a);
+
+        let (rects, n) = settings::sub_rects(row.ctl, right, y);
+        let hov_sub = |k: usize| matches!(sc.hover, Hit::Set(j, s) if j == i && s as usize == k);
+        match row.ctl {
+            Ctl::Toggle => {
+                let on = settings::toggle_on(row.id, &view);
+                let r = rects[0];
+                let track = Rect::new(r.x + 1.0, r.y + 1.0, 34.0, 18.0);
+                if on {
+                    cv.fill_rrect(track, 9.0, rgba(sc.accent, a));
+                } else {
+                    cv.fill_rrect(track, 9.0, white((if hov_row { 0.24 } else { 0.16 }) * a));
+                }
+                let kx = if on { track.right() - 9.0 } else { track.x + 9.0 };
+                cv.fill_circle(kx, track.cy(), 7.0, white(a));
+            }
+            Ctl::Seg(labels) => {
+                let sel = settings::seg_selected(row.id, sc.cfg);
+                let whole = Rect::new(rects[0].x, rects[0].y, rects[n - 1].right() - rects[0].x, rects[0].h);
+                cv.fill_rrect(whole, 10.0, white(0.08 * a));
+                for k in 0..n {
+                    let r = rects[k];
+                    let is_sel = sel == Some(k);
+                    if is_sel {
+                        cv.fill_rrect(r.inflate(-2.0), 8.0, white(0.20 * a));
+                    }
+                    let al = if is_sel { 1.0 } else if hov_sub(k) { 0.85 } else { 0.5 };
+                    cv.text_centered(labels[k], r.cx(), r.y + 14.5, 11.5, Weight::Semibold, WHITE, al * a);
+                }
+            }
+            Ctl::Swatch => {
+                let sel = settings::swatch_selected(sc.cfg);
+                for k in 0..n {
+                    let r = rects[k];
+                    let (cx, cy) = (r.cx(), r.cy());
+                    if k == 0 {
+                        if let Some(ring) = gfx::circle(cx, cy, 5.5) {
+                            cv.stroke(&ring, 1.4, white(0.6 * a), false);
+                        }
+                        cv.text_centered("A", cx, cy + 3.2, 8.5, Weight::Semibold, WHITE, 0.7 * a);
+                    } else {
+                        let col = settings::ACCENTS[k - 1];
+                        cv.fill_circle(cx, cy, if hov_sub(k) { 7.2 } else { 6.5 }, rgba(col, a));
+                    }
+                    if sel == Some(k) {
+                        if let Some(ring) = gfx::circle(cx, cy, 9.0) {
+                            cv.stroke(&ring, 1.5, white(0.9 * a), false);
+                        }
+                    }
+                }
+            }
+            Ctl::Step => {
+                for k in 0..2 {
+                    let r = rects[k];
+                    cv.fill_rrect(r, 10.0, white((if hov_sub(k) { 0.20 } else { 0.10 }) * a));
+                    cv.fill_rrect(Rect::new(r.cx() - 4.0, r.cy() - 0.8, 8.0, 1.6), 0.8, white(a));
+                    if k == 1 {
+                        cv.fill_rrect(Rect::new(r.cx() - 0.8, r.cy() - 4.0, 1.6, 8.0), 0.8, white(a));
+                    }
+                }
+                let mid = (rects[0].right() + rects[1].x) * 0.5;
+                cv.text_centered(&settings::step_text(row.id, sc.cfg), mid, rects[0].y + 14.5, 12.0, Weight::Semibold, WHITE, a);
+            }
+            Ctl::Buttons(labels) => {
+                for k in 0..n {
+                    let r = rects[k];
+                    cv.fill_rrect(r, 10.0, white((if hov_sub(k) { 0.20 } else { 0.10 }) * a));
+                    cv.text_centered(labels[k], r.cx(), r.y + 14.5, 11.5, Weight::Semibold, WHITE, 0.9 * a);
+                }
+            }
+        }
+    }
+    cv.unclip_rect();
+    scroll_thumb(cv, c, settings::ROWS.len(), sc.sscroll, ox, a);
 }
 
 // -------------------------------------------------------------------- icons

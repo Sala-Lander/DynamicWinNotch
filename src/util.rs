@@ -158,9 +158,74 @@ pub fn avg_color_premul(rgba: &[u8]) -> (u8, u8, u8) {
     (f(r), f(g), f(b))
 }
 
+/// Largest size that fits `max_w` x `max_h` and keeps the aspect ratio (never upscales, never 0).
+pub fn fit_dims(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    if w == 0 || h == 0 {
+        return (1, 1);
+    }
+    let s = (max_w as f32 / w as f32).min(max_h as f32 / h as f32).min(1.0);
+    (((w as f32 * s).round() as u32).max(1), ((h as f32 * s).round() as u32).max(1))
+}
+
+/// Straight RGBA -> premultiplied RGBA, in place (what tiny-skia pixmaps hold).
+pub fn premultiply_rgba(px: &mut [u8]) {
+    for p in px.chunks_exact_mut(4) {
+        let a = p[3] as u32;
+        if a != 255 {
+            for c in p.iter_mut().take(3) {
+                *c = ((*c as u32 * a + 127) / 255) as u8;
+            }
+        }
+    }
+}
+
+/// 64-bit FNV-1a, used to recognise that the same image was copied twice.
+pub fn fnv1a(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// "812 B", "34 KB", "1.2 MB".
+pub fn fmt_bytes(n: usize) -> String {
+    const KB: f64 = 1024.0;
+    let f = n as f64;
+    if f < KB {
+        format!("{n} B")
+    } else if f < KB * KB {
+        format!("{:.0} KB", f / KB)
+    } else {
+        format!("{:.1} MB", f / (KB * KB))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thumb_helpers() {
+        assert_eq!(fit_dims(1920, 1080, 96, 60), (96, 54));
+        assert_eq!(fit_dims(1080, 1920, 96, 60), (34, 60));
+        assert_eq!(fit_dims(40, 20, 96, 60), (40, 20)); // never upscaled
+        assert_eq!(fit_dims(0, 5, 96, 60), (1, 1));
+        assert_eq!(fit_dims(10000, 1, 96, 60), (96, 1));
+
+        let mut px = [200u8, 100, 50, 128, 10, 20, 30, 255, 255, 255, 255, 0];
+        premultiply_rgba(&mut px);
+        assert_eq!(px, [100, 50, 25, 128, 10, 20, 30, 255, 0, 0, 0, 0]);
+
+        assert_ne!(fnv1a(b"abc"), fnv1a(b"abd"));
+        assert_eq!(fnv1a(b"abc"), fnv1a(b"abc"));
+        assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
+
+        assert_eq!(fmt_bytes(812), "812 B");
+        assert_eq!(fmt_bytes(34 * 1024), "34 KB");
+        assert_eq!(fmt_bytes(1_258_291), "1.2 MB");
+    }
 
     #[test]
     fn square_crop_and_swizzle() {

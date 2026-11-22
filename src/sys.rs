@@ -2,6 +2,7 @@
 //! System tab is on screen, so it costs nothing the rest of the time.
 
 use crate::ffi::*;
+use crate::power::Power;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Stats {
@@ -42,6 +43,17 @@ pub fn decode_power(ac_line: u8, flag: u8, percent: u8, life_time: u32) -> (Opti
     let charging = flag & 8 != 0;
     let secs = if life_time == u32::MAX || on_ac { None } else { Some(life_time) };
     (Some(percent), charging, on_ac, secs)
+}
+
+/// One cheap read of the power state (used by the battery / charger alerts).
+pub fn power_now() -> Power {
+    let mut ps = SYSTEM_POWER_STATUS::default();
+    if unsafe { GetSystemPowerStatus(&mut ps) } != 0 {
+        let (pct, charging, on_ac, _) = decode_power(ps.ACLineStatus, ps.BatteryFlag, ps.BatteryLifePercent, ps.BatteryLifeTime);
+        Power { pct, on_ac, charging }
+    } else {
+        Power { pct: None, on_ac: true, charging: false }
+    }
 }
 
 impl Sampler {

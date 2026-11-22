@@ -43,6 +43,8 @@ pub enum Ev {
     Hotkey,
     DisplayChange,
     TaskbarCreated,
+    /// Charger plugged / unplugged or the battery level changed.
+    Power,
 }
 
 thread_local! {
@@ -115,6 +117,12 @@ unsafe extern "system" fn wndproc(hwnd: HANDLE, msg: u32, wp: usize, lp: isize) 
         WM_HOTKEY => {
             push(Ev::Hotkey);
             0
+        }
+        WM_POWERBROADCAST => {
+            if wp == PBT_APMPOWERSTATUSCHANGE {
+                push(Ev::Power);
+            }
+            1 // TRUE: the broadcast is handled
         }
         WM_DISPLAYCHANGE | WM_DPICHANGED => {
             push(Ev::DisplayChange);

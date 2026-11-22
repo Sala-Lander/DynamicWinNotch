@@ -8,13 +8,17 @@
 mod app;
 mod clip;
 mod config;
+mod detect;
 mod ffi;
 mod gfx;
 mod history;
 mod layout;
 mod media;
+mod power;
+mod settings;
 mod spring;
 mod sys;
+mod timer;
 mod ui;
 mod util;
 mod win;
