@@ -712,6 +712,12 @@ pub struct POWERBROADCAST_SETTING {
 #[link(name = "user32")]
 extern "system" {
     pub fn RegisterPowerSettingNotification(recipient: HANDLE, setting: *const GUID, flags: u32) -> HANDLE;
+    pub fn AttachThreadInput(attach: u32, attach_to: u32, on: i32) -> i32;
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    pub fn GetCurrentThreadId() -> u32;
 }
 
 #[cfg(test)]

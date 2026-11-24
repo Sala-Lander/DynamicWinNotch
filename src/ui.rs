@@ -207,16 +207,18 @@ fn draw_compact(cv: &mut Canvas, sc: &Scene, a: f32) {
     let ca = a * (1.0 - sc.peek_mix);
     let pa = a * sc.peek_mix;
 
+    // Privacy dots at the far right (camera green, microphone orange, like iOS). They stay
+    // through peeks; the peek content makes room for them.
+    let mut dots_w = 0.0;
+    for (on, col) in [(sc.cam_on, CAM_GREEN), (sc.mic_on, MIC_ORANGE)] {
+        if on {
+            cv.fill_circle(p.right() - 11.0 - dots_w, p.cy(), 3.2, rgba(col, a));
+            dots_w += 9.0;
+        }
+    }
     if ca > 0.01 {
         let cy = p.cy();
-        // Privacy dots at the far right (camera green, microphone orange, like iOS).
-        let mut right = p.right();
-        for (on, col) in [(sc.cam_on, CAM_GREEN), (sc.mic_on, MIC_ORANGE)] {
-            if on {
-                cv.fill_circle(right - 11.0, cy, 3.2, rgba(col, ca));
-                right -= 9.0;
-            }
-        }
+        let right = p.right() - dots_w;
         // Running timer: a small ring and the remaining time. It sits on the right next to the
         // equalizer, or in the middle when nothing is playing.
         let mut eq_right = right - 14.0;
@@ -244,7 +246,7 @@ fn draw_compact(cv: &mut Canvas, sc: &Scene, a: f32) {
     }
     if pa > 0.01 {
         if let Some(pk) = sc.peek {
-            draw_peek(cv, sc, pk, pa);
+            draw_peek(cv, sc, pk, pa, dots_w);
         }
     }
 }
@@ -271,8 +273,10 @@ fn draw_ring(cv: &mut Canvas, cx: f32, cy: f32, r: f32, width: f32, frac: f32, c
     }
 }
 
-fn draw_peek(cv: &mut Canvas, sc: &Scene, pk: &PeekInfo, a: f32) {
+/// `reserved`: width kept free at the right edge (privacy dots).
+fn draw_peek(cv: &mut Canvas, sc: &Scene, pk: &PeekInfo, a: f32, reserved: f32) {
     let p = sc.pill;
+    let pr = p.right() - reserved;
     let cy = p.cy();
     let mut x = p.x + 10.0;
     let cell = Rect::new(x, cy - 15.0, 30.0, 30.0);
@@ -344,20 +348,20 @@ fn draw_peek(cv: &mut Canvas, sc: &Scene, pk: &PeekInfo, a: f32) {
         _ => None,
     };
     if let (Some(muted), Some(level)) = (bar_level, pk.level) {
-        let bar = Rect::new(p.right() - 14.0 - VOL_BAR_W, cy - 2.0, VOL_BAR_W, 4.0);
+        let bar = Rect::new(pr - 14.0 - VOL_BAR_W, cy - 2.0, VOL_BAR_W, 4.0);
         cv.fill_rrect(bar, 2.0, white(0.15 * a));
         let f = if muted { 0.0 } else { level.clamp(0.0, 1.0) };
         if f > 0.0 {
             cv.fill_rrect(Rect::new(bar.x, bar.y, (bar.w * f).max(4.0), bar.h), 2.0, rgba(sc.accent, a));
         }
     }
-    let w = (p.right() - right_pad - x).max(20.0);
+    let w = (pr - right_pad - x).max(20.0);
     let l1 = cv.fit(&pk.line1, 13.0, Weight::Semibold, w);
     cv.text(&l1, x, cy - 2.0, 13.0, Weight::Semibold, WHITE, a);
     let l2 = cv.fit(&pk.line2, 11.0, Weight::Regular, w);
     cv.text(&l2, x, cy + 12.0, 11.0, Weight::Regular, WHITE, 0.55 * a);
     if pk.kind == PeekKind::Track {
-        draw_eq(cv, p.right() - 14.0, cy, sc.media.info.playing, sc.now, sc.accent, a);
+        draw_eq(cv, pr - 14.0, cy, sc.media.info.playing, sc.now, sc.accent, a);
     }
 }
 

@@ -184,9 +184,10 @@ unsafe extern "system" fn wndproc(hwnd: HANDLE, msg: u32, wp: usize, lp: isize) 
             if wp == PBT_APMPOWERSTATUSCHANGE {
                 push(Ev::Power);
             } else if wp == PBT_POWERSETTINGCHANGE && lp != 0 {
-                let s = &*(lp as *const POWERBROADCAST_SETTING);
-                if s.PowerSetting == GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS && s.DataLength >= 4 {
-                    let pct = std::ptr::read_unaligned(s.Data.as_ptr() as *const u32);
+                // Data is a variable-length tail behind the struct: read it through the raw pointer.
+                let setting = lp as *const POWERBROADCAST_SETTING;
+                if (*setting).PowerSetting == GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS && (*setting).DataLength >= 4 {
+                    let pct = std::ptr::addr_of!((*setting).Data).cast::<u32>().read_unaligned();
                     push(Ev::Brightness(pct.min(100)));
                 }
             }
@@ -280,6 +281,21 @@ pub fn fullscreen_app_active() -> bool {
     let mut st = 0i32;
     let hr = unsafe { SHQueryUserNotificationState(&mut st) };
     hr >= 0 && matches!(st, QUNS_BUSY | QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE)
+}
+
+/// Toggle state of Caps / Num Lock as the foreground app sees it. `GetKeyState` only reflects
+/// the calling thread's input state, so the read borrows the foreground thread's for a moment.
+pub fn lock_key_on(vk: u16) -> bool {
+    unsafe {
+        let me = GetCurrentThreadId();
+        let fg = GetWindowThreadProcessId(GetForegroundWindow(), null_mut());
+        let attached = fg != 0 && fg != me && AttachThreadInput(me, fg, 1) != 0;
+        let on = GetKeyState(vk as i32) & 1 != 0;
+        if attached {
+            AttachThreadInput(me, fg, 0);
+        }
+        on
+    }
 }
 
 /// Start / focus an app by its App User Model ID (what a toast notification carries).

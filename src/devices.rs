@@ -16,9 +16,10 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use windows::core::{implement, IInspectable};
+use windows::core::{implement, IInspectable, HSTRING};
 use windows::Devices::Bluetooth::{BluetoothConnectionStatus, BluetoothDevice, BluetoothLEDevice};
-use windows::Devices::Enumeration::{DeviceInformation, DeviceInformationUpdate, DeviceWatcher};
+use windows::Devices::Enumeration::{DeviceInformation, DeviceInformationKind, DeviceInformationUpdate, DeviceWatcher};
+use windows::Foundation::Collections::IIterable;
 use windows::Foundation::TypedEventHandler;
 use windows::Win32::Media::Audio::Endpoints::{
     IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl,
@@ -182,21 +183,19 @@ pub fn spawn_privacy(hwnd: HANDLE) -> Arc<Mutex<InUse>> {
     let _ = std::thread::Builder::new().name("privacy".into()).stack_size(256 << 10).spawn(move || unsafe {
         let names = ["microphone", "webcam"];
         let mut keys: [HANDLE; 2] = [0; 2];
+        // A watch is one-shot; re-arm a key only after its own event fired (re-arming a pending
+        // watch would stack another wait operation).
+        let mut armed = [false; 2];
         let events = [CreateEventW(null(), 0, 0, null()), CreateEventW(null(), 0, 0, null())];
         loop {
             for i in 0..2 {
                 if keys[i] == 0 {
                     keys[i] = open_key(HKEY_CURRENT_USER, &format!("{CONSENT}{}", names[i]));
                 }
-                if keys[i] != 0 {
-                    // One-shot: re-armed every round, before reading, so no change slips through.
-                    RegNotifyChangeKeyValue(
-                        keys[i],
-                        1,
-                        REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET,
-                        events[i],
-                        1,
-                    );
+                if keys[i] != 0 && !armed[i] {
+                    // Armed before reading, so no change slips through.
+                    let filter = REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET;
+                    armed[i] = RegNotifyChangeKeyValue(keys[i], 1, filter, events[i], 1) == 0;
                 }
             }
             let now = InUse { mic: active_app(keys[0]), cam: active_app(keys[1]) };
@@ -207,9 +206,12 @@ pub fn spawn_privacy(hwnd: HANDLE) -> Arc<Mutex<InUse>> {
                     PostMessageW(hwnd, WM_APP_PRIVACY, 0, 0);
                 }
             }
-            // Missing keys (no app ever asked) are retried once a minute.
-            let wait = if keys.contains(&0) { 60_000 } else { u32::MAX };
-            WaitForMultipleObjects(2, events.as_ptr(), 0, wait);
+            // Missing keys (no app ever asked) or failed watches are retried once a minute.
+            let wait = if armed.contains(&false) { 60_000 } else { u32::MAX };
+            let r = WaitForMultipleObjects(2, events.as_ptr(), 0, wait);
+            if (r as usize) < armed.len() {
+                armed[r as usize] = false; // WAIT_OBJECT_0 + i: that watch completed
+            }
         }
     });
     shared
@@ -281,7 +283,16 @@ pub fn spawn_bluetooth(hwnd: HANDLE) -> Arc<Mutex<Vec<BtEvent>>> {
         ];
         let mut watchers = Vec::new();
         for sel in selectors.into_iter().flatten() {
-            if let Ok(w) = DeviceInformation::CreateWatcherAqsFilter(&sel) {
+            // The selectors describe association endpoints; ask for that kind explicitly.
+            let none = IIterable::<HSTRING>::try_from(Vec::<HSTRING>::new());
+            let w = none.and_then(|props| {
+                DeviceInformation::CreateWatcherWithKindAqsFilterAndAdditionalProperties(
+                    &sel,
+                    &props,
+                    DeviceInformationKind::AssociationEndpoint,
+                )
+            });
+            if let Ok(w) = w {
                 if watch_bt(&w, hwnd, &out).is_ok() {
                     watchers.push(w);
                 }

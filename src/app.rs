@@ -11,7 +11,7 @@
 use crate::clip::{self, ClipCmd, ClipFlags, ClipItem};
 use crate::config::{self, gb, Config, Dnd, ExpandOn, FullscreenMode};
 use crate::ffi::{
-    GetKeyState, MessageBeep, PostQuitMessage, MB_ICONASTERISK, VK_BACK, VK_CAPITAL, VK_ESCAPE, VK_RETURN, WM_LBUTTONUP,
+    MessageBeep, PostQuitMessage, MB_ICONASTERISK, VK_BACK, VK_CAPITAL, VK_ESCAPE, VK_RETURN, WM_LBUTTONUP,
     WM_RBUTTONUP,
 };
 use crate::gfx::{pixmap_from_rgba, Canvas};
@@ -553,7 +553,7 @@ impl App {
         if !self.cfg.lock_peek {
             return;
         }
-        let on = unsafe { GetKeyState(vk as i32) } & 1 != 0;
+        let on = win::lock_key_on(vk);
         let caps = vk == VK_CAPITAL;
         let l1 = if caps { "Caps Lock" } else { "Num Lock" };
         let info = PeekInfo::new(PeekKind::Lock(caps, on), l1.to_string(), if on { "On" } else { "Off" }.to_string());
