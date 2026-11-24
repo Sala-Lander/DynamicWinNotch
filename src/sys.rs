@@ -147,8 +147,7 @@ pub fn decode_power(ac_line: u8, flag: u8, percent: u8, life_time: u32) -> (Opti
 pub fn power_now() -> Power {
     let mut ps = SYSTEM_POWER_STATUS::default();
     if unsafe { GetSystemPowerStatus(&mut ps) } != 0 {
-        let (pct, charging, on_ac, _) =
-            decode_power(ps.ACLineStatus, ps.BatteryFlag, ps.BatteryLifePercent, ps.BatteryLifeTime);
+        let (pct, charging, on_ac, _) = decode_power(ps.ACLineStatus, ps.BatteryFlag, ps.BatteryLifePercent, ps.BatteryLifeTime);
         Power { pct, on_ac, charging }
     } else {
         Power { pct: None, on_ac: true, charging: false }
