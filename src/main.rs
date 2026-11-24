@@ -9,6 +9,7 @@ mod app;
 mod clip;
 mod config;
 mod detect;
+mod devices;
 mod ffi;
 mod fps;
 mod gfx;

@@ -2,7 +2,7 @@
 //! sits and what a click on it does to the `Config`. No OS calls and no drawing, so the whole
 //! thing is unit-tested; `ui.rs` paints it and `layout.rs` hit-tests it from the same numbers.
 
-use crate::config::{gb, Config, ExpandOn, FullscreenMode};
+use crate::config::{gb, Config, Dnd, ExpandOn, FullscreenMode};
 use crate::layout::{Rect, Style, ROW_H};
 
 /// Accent swatches offered in the UI (sub-control 0 is "auto", 1.. map to these).
@@ -38,6 +38,12 @@ pub enum Id {
     GameFrames,
     GameSystem,
     NetSpeed,
+    VolumePeek,
+    BrightnessPeek,
+    LockPeek,
+    BtPeek,
+    PrivacyDot,
+    Dnd,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,7 +68,7 @@ pub struct Row {
     pub ctl: Ctl,
 }
 
-pub const ROWS: [Row; 21] = [
+pub const ROWS: [Row; 27] = [
     Row { id: Id::ExpandOn, label: "Expand on", ctl: Ctl::Seg(&["Hover", "Click"]) },
     Row { id: Id::Style, label: "Style", ctl: Ctl::Seg(&["Notch", "Island"]) },
     Row { id: Id::Accent, label: "Accent colour", ctl: Ctl::Swatch },
@@ -73,6 +79,12 @@ pub const ROWS: [Row; 21] = [
     Row { id: Id::TimerSound, label: "Timer sound", ctl: Ctl::Toggle },
     Row { id: Id::ClipImages, label: "Clipboard images", ctl: Ctl::Toggle },
     Row { id: Id::Notifications, label: "Notification peeks", ctl: Ctl::Toggle },
+    Row { id: Id::VolumePeek, label: "Volume peek", ctl: Ctl::Toggle },
+    Row { id: Id::BrightnessPeek, label: "Brightness peek", ctl: Ctl::Toggle },
+    Row { id: Id::LockPeek, label: "Caps / Num Lock peek", ctl: Ctl::Toggle },
+    Row { id: Id::BtPeek, label: "Bluetooth peek", ctl: Ctl::Toggle },
+    Row { id: Id::PrivacyDot, label: "Mic & camera indicator", ctl: Ctl::Toggle },
+    Row { id: Id::Dnd, label: "Do not disturb", ctl: Ctl::Seg(&["Off", "On", "Games"]) },
     Row { id: Id::Privacy, label: "Skip password managers", ctl: Ctl::Toggle },
     Row { id: Id::HistorySize, label: "Clipboard history", ctl: Ctl::Step },
     Row { id: Id::HideFullscreen, label: "Hide in full screen", ctl: Ctl::Toggle },
@@ -183,6 +195,11 @@ pub fn toggle_on(id: Id, v: &View) -> bool {
         Id::HideFullscreen => c.hide_fullscreen,
         Id::Notifications => c.notifications,
         Id::NetSpeed => c.net_speed,
+        Id::VolumePeek => c.volume_peek,
+        Id::BrightnessPeek => c.brightness_peek,
+        Id::LockPeek => c.lock_peek,
+        Id::BtPeek => c.bt_peek,
+        Id::PrivacyDot => c.privacy_dot,
         Id::Autostart => v.autostart,
         _ => false,
     }
@@ -195,6 +212,11 @@ pub fn seg_selected(id: Id, c: &Config) -> Option<usize> {
         Id::Style => Some((c.style == Style::Island) as usize),
         Id::Fps => FPS_STEPS.iter().position(|&f| f == c.fps_cap),
         Id::FullscreenMode => Some((c.fullscreen_mode == FullscreenMode::GameBar) as usize),
+        Id::Dnd => Some(match c.dnd {
+            Dnd::Off => 0,
+            Dnd::On => 1,
+            Dnd::Games => 2,
+        }),
         _ => None,
     }
 }
@@ -260,6 +282,18 @@ pub fn apply(c: &mut Config, autostart: bool, id: Id, sub: usize) -> Action {
         Id::ClipImages => c.clip_images = !c.clip_images,
         Id::Notifications => c.notifications = !c.notifications,
         Id::NetSpeed => c.net_speed = !c.net_speed,
+        Id::VolumePeek => c.volume_peek = !c.volume_peek,
+        Id::BrightnessPeek => c.brightness_peek = !c.brightness_peek,
+        Id::LockPeek => c.lock_peek = !c.lock_peek,
+        Id::BtPeek => c.bt_peek = !c.bt_peek,
+        Id::PrivacyDot => c.privacy_dot = !c.privacy_dot,
+        Id::Dnd => {
+            c.dnd = match sub {
+                1 => Dnd::On,
+                2 => Dnd::Games,
+                _ => Dnd::Off,
+            }
+        }
         Id::GameFrames | Id::GameSystem => {
             if let Some(b) = chip_bits(id).get(sub) {
                 c.game_items ^= b;
@@ -320,6 +354,17 @@ mod tests {
             assert!(rects[0].x > 150.0, "{:?} control starts at {}", row.id, rects[0].x);
             assert!(n <= 8);
         }
+    }
+
+    #[test]
+    fn new_rows_toggle_and_dnd_cycles() {
+        let mut c = Config::default();
+        assert_eq!(apply(&mut c, false, Id::VolumePeek, 0), Action::Changed);
+        assert!(!c.volume_peek);
+        assert_eq!(apply(&mut c, false, Id::Dnd, 2), Action::Changed);
+        assert_eq!(c.dnd, Dnd::Games);
+        assert_eq!(seg_selected(Id::Dnd, &c), Some(2));
+        assert_eq!(apply(&mut c, false, Id::Dnd, 2), Action::Nothing);
     }
 
     #[test]

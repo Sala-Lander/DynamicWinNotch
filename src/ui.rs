@@ -29,6 +29,16 @@ pub enum PeekKind {
     Power(PowerIcon),
     /// A toast notification (app name is drawn as the line1/line2 already carry the text).
     Notification,
+    /// Master volume changed (muted?); `level` carries the volume.
+    Volume(bool),
+    /// Screen brightness changed; `level` carries it.
+    Brightness,
+    /// Caps Lock (`true`) or Num Lock switched; line2 says on / off.
+    Lock(bool, bool),
+    /// An app started using the camera (`true`) or microphone.
+    Privacy(bool),
+    /// A Bluetooth device connected (`true`) or disconnected.
+    Bluetooth(bool),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -49,13 +59,15 @@ pub struct PeekInfo {
     pub thumb: Option<Pixmap>,
     /// Clipboard colour swatch.
     pub color: Option<(u8, u8, u8)>,
-    /// Battery level 0..=1 for power peeks.
+    /// Battery level 0..=1 for power peeks, volume for volume peeks.
     pub level: Option<f32>,
+    /// AUMID of the app a click on this peek opens (notifications).
+    pub open: Option<String>,
 }
 
 impl PeekInfo {
     pub fn new(kind: PeekKind, line1: String, line2: String) -> Self {
-        Self { kind, line1, line2, thumb: None, color: None, level: None }
+        Self { kind, line1, line2, thumb: None, color: None, level: None, open: None }
     }
 }
 
@@ -125,6 +137,9 @@ pub struct Scene<'a> {
     pub frames: Option<FrameStats>,
     pub fps_state: FpsState,
     pub ping_ms: Option<u32>,
+    /// Privacy dots on the collapsed pill: an app uses the microphone / camera.
+    pub mic_on: bool,
+    pub cam_on: bool,
 }
 
 fn white(a: f32) -> Color {
@@ -194,14 +209,22 @@ fn draw_compact(cv: &mut Canvas, sc: &Scene, a: f32) {
 
     if ca > 0.01 {
         let cy = p.cy();
+        // Privacy dots at the far right (camera green, microphone orange, like iOS).
+        let mut right = p.right();
+        for (on, col) in [(sc.cam_on, CAM_GREEN), (sc.mic_on, MIC_ORANGE)] {
+            if on {
+                cv.fill_circle(right - 11.0, cy, 3.2, rgba(col, ca));
+                right -= 9.0;
+            }
+        }
         // Running timer: a small ring and the remaining time. It sits on the right next to the
         // equalizer, or in the middle when nothing is playing.
-        let mut eq_right = p.right() - 14.0;
+        let mut eq_right = right - 14.0;
         if sc.timer.running {
             let txt = fmt_clock(sc.timer.secs);
             let tw = cv.text_width(&txt, 12.0, Weight::Semibold);
             let (ring_cx, text_x) = if show_media {
-                let tx = p.right() - 12.0 - tw;
+                let tx = right - 12.0 - tw;
                 eq_right = tx - 18.0 - 12.0;
                 (tx - 11.0, tx)
             } else {
@@ -281,9 +304,53 @@ fn draw_peek(cv: &mut Canvas, sc: &Scene, pk: &PeekInfo, a: f32) {
             cv.fill_rrect(cell, 8.0, white(0.10 * a));
             draw_bell(cv, cell.cx(), cell.cy(), 0.55, 0.85 * a);
         }
+        PeekKind::Volume(muted) => {
+            cv.fill_rrect(cell, 8.0, white(0.10 * a));
+            draw_speaker(cv, cell.cx(), cy, muted, a);
+        }
+        PeekKind::Brightness => {
+            cv.fill_rrect(cell, 8.0, white(0.10 * a));
+            draw_sun(cv, cell.cx(), cy, a);
+        }
+        PeekKind::Lock(caps, on) => {
+            cv.fill_rrect(cell, 8.0, white(0.10 * a));
+            let glyph = match (caps, on) {
+                (true, true) => "A",
+                (true, false) => "a",
+                _ => "1",
+            };
+            let (col, ga) = if on { (sc.accent, a) } else { (WHITE, 0.5 * a) };
+            cv.text_centered(glyph, cell.cx(), cy + 5.0, 15.0, Weight::Semibold, col, ga);
+        }
+        PeekKind::Privacy(cam) => {
+            cv.fill_rrect(cell, 8.0, white(0.10 * a));
+            cv.fill_circle(cell.cx(), cy, 6.0, rgba(if cam { CAM_GREEN } else { MIC_ORANGE }, a));
+        }
+        PeekKind::Bluetooth(connected) => {
+            cv.fill_rrect(cell, 8.0, white(0.10 * a));
+            let col = if connected { rgba(sc.accent, a) } else { white(0.5 * a) };
+            draw_bt_rune(cv, cell.cx(), cy, col);
+        }
     }
     x += 40.0;
-    let right_pad = if pk.kind == PeekKind::Track { 38.0 } else { 14.0 };
+    let right_pad = match pk.kind {
+        PeekKind::Track => 38.0,
+        PeekKind::Volume(_) | PeekKind::Brightness => 14.0 + VOL_BAR_W + 10.0,
+        _ => 14.0,
+    };
+    let bar_level = match pk.kind {
+        PeekKind::Volume(muted) => Some(muted),
+        PeekKind::Brightness => Some(false),
+        _ => None,
+    };
+    if let (Some(muted), Some(level)) = (bar_level, pk.level) {
+        let bar = Rect::new(p.right() - 14.0 - VOL_BAR_W, cy - 2.0, VOL_BAR_W, 4.0);
+        cv.fill_rrect(bar, 2.0, white(0.15 * a));
+        let f = if muted { 0.0 } else { level.clamp(0.0, 1.0) };
+        if f > 0.0 {
+            cv.fill_rrect(Rect::new(bar.x, bar.y, (bar.w * f).max(4.0), bar.h), 2.0, rgba(sc.accent, a));
+        }
+    }
     let w = (p.right() - right_pad - x).max(20.0);
     let l1 = cv.fit(&pk.line1, 13.0, Weight::Semibold, w);
     cv.text(&l1, x, cy - 2.0, 13.0, Weight::Semibold, WHITE, a);
@@ -324,6 +391,64 @@ fn draw_power_icon(cv: &mut Canvas, cx: f32, cy: f32, icon: PowerIcon, level: f3
 }
 
 /// A small notification bell: body + clapper, for the notification peek.
+const CAM_GREEN: (u8, u8, u8) = (48, 209, 88);
+const MIC_ORANGE: (u8, u8, u8) = (255, 159, 10);
+const VOL_BAR_W: f32 = 72.0;
+
+/// Speaker cone with sound waves, or a cross when muted.
+fn draw_speaker(cv: &mut Canvas, cx: f32, cy: f32, muted: bool, a: f32) {
+    let x = cx - 6.0;
+    let cone = [(x, cy - 2.5), (x + 3.0, cy - 2.5), (x + 7.0, cy - 6.0), (x + 7.0, cy + 6.0), (x + 3.0, cy + 2.5), (x, cy + 2.5)];
+    if let Some(body) = gfx::poly(&cone) {
+        cv.fill(&body, white(0.9 * a));
+    }
+    if muted {
+        for (dx, dy) in [(1.0, 1.0), (1.0, -1.0)] {
+            let mut pb = tiny_skia::PathBuilder::new();
+            pb.move_to(x + 10.0, cy - 3.0 * dy);
+            pb.line_to(x + 10.0 + 6.0 * dx, cy + 3.0 * dy);
+            if let Some(l) = pb.finish() {
+                cv.stroke(&l, 1.6, white(0.9 * a), true);
+            }
+        }
+    } else {
+        for r in [4.5, 8.0] {
+            if let Some(arc) = gfx::arc_path(x + 6.0, cy, r, -0.8, 1.6) {
+                cv.stroke(&arc, 1.5, white(0.9 * a), true);
+            }
+        }
+    }
+}
+
+/// Sun: a disc with eight short rays.
+fn draw_sun(cv: &mut Canvas, cx: f32, cy: f32, a: f32) {
+    cv.fill_circle(cx, cy, 3.6, white(0.9 * a));
+    for k in 0..8 {
+        let ang = k as f32 * std::f32::consts::FRAC_PI_4;
+        let (s, c) = ang.sin_cos();
+        let mut pb = tiny_skia::PathBuilder::new();
+        pb.move_to(cx + c * 6.0, cy + s * 6.0);
+        pb.line_to(cx + c * 8.5, cy + s * 8.5);
+        if let Some(l) = pb.finish() {
+            cv.stroke(&l, 1.5, white(0.9 * a), true);
+        }
+    }
+}
+
+/// The Bluetooth rune.
+fn draw_bt_rune(cv: &mut Canvas, cx: f32, cy: f32, col: Color) {
+    let mut pb = tiny_skia::PathBuilder::new();
+    pb.move_to(cx - 4.5, cy - 4.0);
+    pb.line_to(cx + 4.0, cy + 4.0);
+    pb.line_to(cx, cy + 8.0);
+    pb.line_to(cx, cy - 8.0);
+    pb.line_to(cx + 4.0, cy - 4.0);
+    pb.line_to(cx - 4.5, cy + 4.0);
+    if let Some(path) = pb.finish() {
+        cv.stroke(&path, 1.6, col, true);
+    }
+}
+
 fn draw_bell(cv: &mut Canvas, cx: f32, cy: f32, scale: f32, a: f32) {
     let col = white(a);
     if let Some(p) = gfx::arc_path(cx, cy - 1.5 * scale, 7.0 * scale, std::f32::consts::PI, std::f32::consts::PI) {

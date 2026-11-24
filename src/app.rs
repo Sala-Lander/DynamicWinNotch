@@ -9,13 +9,17 @@
 //! 4-second housekeeping tick.
 
 use crate::clip::{self, ClipCmd, ClipFlags, ClipItem};
-use crate::config::{self, gb, Config, ExpandOn, FullscreenMode};
-use crate::ffi::{MessageBeep, PostQuitMessage, MB_ICONASTERISK, VK_BACK, VK_ESCAPE, VK_RETURN, WM_LBUTTONUP, WM_RBUTTONUP};
+use crate::config::{self, gb, Config, Dnd, ExpandOn, FullscreenMode};
+use crate::ffi::{
+    GetKeyState, MessageBeep, PostQuitMessage, MB_ICONASTERISK, VK_BACK, VK_CAPITAL, VK_ESCAPE, VK_RETURN, WM_LBUTTONUP,
+    WM_RBUTTONUP,
+};
 use crate::gfx::{pixmap_from_rgba, Canvas};
 use crate::history::{Entry, History, Kind};
 use crate::layout::{
     self, Geo, Hit, Rect, Tab, CLIP_VISIBLE_ROWS, COLLAPSED, EXPANDED, PEEK, TAB_COUNT, TIMER_PRESETS, VISIBLE_ROWS,
 };
+use crate::devices::{self, BtEvent, InUse};
 use crate::media::{self, Cmd, MediaView, Msg, Shared};
 use crate::notify;
 use crate::power::{PowerEvent, Watcher};
@@ -40,6 +44,12 @@ pub enum Next {
 const DEFAULT_ACCENT: (u8, u8, u8) = (122, 168, 255);
 const PEEK_MS: u64 = 3200;
 const TIMER_PEEK_MS: u64 = 6000;
+const VOLUME_PEEK_MS: u64 = 1500;
+const LOCK_PEEK_MS: u64 = 1300;
+/// Lock-key state is read this long after the key-down, once Windows has flipped it.
+const LOCK_SETTLE: Duration = Duration::from_millis(60);
+/// A dual-mode Bluetooth device shows up as classic and LE: one peek is enough.
+const BT_DEDUP: Duration = Duration::from_secs(3);
 /// "Saved" note in the Settings header: fully visible for this long, then it fades out.
 const SAVED_HOLD: f32 = 1.0;
 const SAVED_FADE: f32 = 0.6;
@@ -110,6 +120,15 @@ pub struct App {
     /// The "notifications blocked" hint was already shown since peeks were switched on.
     notify_hint_shown: bool,
 
+    privacy: Arc<Mutex<InUse>>,
+    in_use: InUse,
+    bt: Arc<Mutex<Vec<BtEvent>>>,
+    last_bt: Option<(BtEvent, Instant)>,
+    /// Last reported screen brightness (the first report after start-up is only a baseline).
+    brightness: Option<u32>,
+    /// Caps / Num Lock key pressed: read its new state at this instant.
+    lock_check: Option<(u16, Instant)>,
+
     /// Click-through "game bar" shown over full-screen apps when `fullscreen_mode` is
     /// `GameBar` instead of the normal hide behaviour.
     game_bar: bool,
@@ -146,6 +165,10 @@ impl App {
         let tray = Tray::add(win.hwnd);
         win.listen_clipboard();
         win.register_hotkey(cfg.hotkey);
+        win.watch_lock_keys(cfg.lock_peek);
+        devices::spawn_volume(win.hwnd);
+        let privacy = devices::spawn_privacy(win.hwnd);
+        let bt = devices::spawn_bluetooth(win.hwnd);
         let (media_tx, media_shared) = media::spawn(win.hwnd, cfg.album_art);
         let clip_flags = ClipFlags::new(cfg.clip_images, cfg.privacy_filter);
         let (clip_tx, clip_rx) = clip::spawn(win.hwnd, clip_flags.clone());
@@ -210,6 +233,12 @@ impl App {
             notify_hint_shown: false,
             notify_shared,
             notify_seen_gen: 0,
+            privacy,
+            in_use: InUse::default(),
+            bt,
+            last_bt: None,
+            lock_check: None,
+            brightness: None,
             game_bar: false,
             start: now,
             last_step: now,
@@ -253,8 +282,8 @@ impl App {
             self.dirty = true;
         }
         self.update_periodic(now);
-        self.win
-            .set_click_through(self.game_bar || (!self.expanded && self.cfg.expand_on == ExpandOn::Hover));
+        let hover_mode = !self.expanded && self.cfg.expand_on == ExpandOn::Hover;
+        self.win.set_click_through(self.game_bar || (hover_mode && self.peek_link().is_none()));
 
         // Render at most `fps_cap` times per second.
         let min_iv = Duration::from_secs_f32(1.0 / self.cfg.fps_cap.max(1) as f32);
@@ -368,7 +397,10 @@ impl App {
             return;
         }
         let (cx, cy) = self.cursor;
-        if !self.expanded {
+        if !self.expanded && self.peek_link().is_some() {
+            // A clickable notification peek: hovering must not turn it into the expanded island.
+            self.hover_since = None;
+        } else if !self.expanded {
             if self.hot_rect().contains(cx, cy) {
                 let since = *self.hover_since.get_or_insert(now);
                 if self.cfg.expand_on == ExpandOn::Hover && now.saturating_duration_since(since) >= ms(self.cfg.hover_delay_ms) {
@@ -469,9 +501,93 @@ impl App {
         if self.expanded {
             return;
         }
+        let quiet = matches!(
+            info.kind,
+            PeekKind::Track | PeekKind::Clip | PeekKind::Notification | PeekKind::Bluetooth(_) | PeekKind::Privacy(_)
+        );
+        if quiet && self.dnd_active() {
+            return;
+        }
         self.peek = Some((info, now + Duration::from_millis(for_ms)));
         self.trimmed = false;
         self.dirty = true;
+    }
+
+    fn dnd_active(&self) -> bool {
+        match self.cfg.dnd {
+            Dnd::Off => false,
+            Dnd::On => true,
+            Dnd::Games => self.game_bar || self.fs_hidden || win::fullscreen_app_active(),
+        }
+    }
+
+    /// AUMID of the app the current (notification) peek opens when clicked.
+    fn peek_link(&self) -> Option<&str> {
+        self.peek.as_ref().and_then(|(p, _)| p.open.as_deref())
+    }
+
+    // ------------------------------------------------------------- devices
+    fn on_volume(&mut self, pct: u32, muted: bool, now: Instant) {
+        if !self.cfg.volume_peek {
+            return;
+        }
+        let line2 = if muted { "Muted".to_string() } else { format!("{pct}%") };
+        let mut info = PeekInfo::new(PeekKind::Volume(muted), "Volume".to_string(), line2);
+        info.level = Some(pct as f32 / 100.0);
+        self.start_peek(info, VOLUME_PEEK_MS, now);
+    }
+
+    fn on_brightness(&mut self, pct: u32, now: Instant) {
+        // Registration (and power-plan switches) re-send the current value: only real changes peek.
+        let changed = self.brightness.is_some_and(|b| b != pct);
+        self.brightness = Some(pct);
+        if !changed || !self.cfg.brightness_peek {
+            return;
+        }
+        let mut info = PeekInfo::new(PeekKind::Brightness, "Brightness".to_string(), format!("{pct}%"));
+        info.level = Some(pct as f32 / 100.0);
+        self.start_peek(info, VOLUME_PEEK_MS, now);
+    }
+
+    fn on_lock_settled(&mut self, vk: u16, now: Instant) {
+        if !self.cfg.lock_peek {
+            return;
+        }
+        let on = unsafe { GetKeyState(vk as i32) } & 1 != 0;
+        let caps = vk == VK_CAPITAL;
+        let l1 = if caps { "Caps Lock" } else { "Num Lock" };
+        let info = PeekInfo::new(PeekKind::Lock(caps, on), l1.to_string(), if on { "On" } else { "Off" }.to_string());
+        self.start_peek(info, LOCK_PEEK_MS, now);
+    }
+
+    fn on_privacy(&mut self, now: Instant) {
+        let cur = self.privacy.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let prev = std::mem::replace(&mut self.in_use, cur.clone());
+        self.dirty = true;
+        if !self.cfg.privacy_dot {
+            return;
+        }
+        if let (Some(app), None) = (&cur.cam, &prev.cam) {
+            let info = PeekInfo::new(PeekKind::Privacy(true), "Camera in use".to_string(), app.clone());
+            self.start_peek(info, PEEK_MS, now);
+        } else if let (Some(app), None) = (&cur.mic, &prev.mic) {
+            let info = PeekInfo::new(PeekKind::Privacy(false), "Microphone in use".to_string(), app.clone());
+            self.start_peek(info, PEEK_MS, now);
+        }
+    }
+
+    fn on_bluetooth(&mut self, now: Instant) {
+        let events = std::mem::take(&mut *self.bt.lock().unwrap_or_else(|e| e.into_inner()));
+        for ev in events {
+            let dup = self.last_bt.as_ref().is_some_and(|(e, t)| *e == ev && now.saturating_duration_since(*t) < BT_DEDUP);
+            if dup || !self.cfg.bt_peek {
+                continue;
+            }
+            let line2 = if ev.connected { "Connected" } else { "Disconnected" };
+            let info = PeekInfo::new(PeekKind::Bluetooth(ev.connected), ev.name.clone(), line2.to_string());
+            self.start_peek(info, PEEK_MS, now);
+            self.last_bt = Some((ev, now));
+        }
     }
 
     // ------------------------------------------------------------- sampling
@@ -505,6 +621,12 @@ impl App {
             if now >= *until {
                 self.peek = None;
                 self.dirty = true;
+            }
+        }
+        if let Some((vk, t)) = self.lock_check {
+            if now >= t {
+                self.lock_check = None;
+                self.on_lock_settled(vk, now);
             }
         }
         if let Some(t) = self.press_until {
@@ -642,7 +764,8 @@ impl App {
         if let Some(n) = notif {
             let line2 = if n.body.is_empty() { n.app.clone() } else { format!("{} \u{b7} {}", n.app, single_line(&n.body, 60)) };
             let title = if n.title.is_empty() { n.app.clone() } else { single_line(&n.title, 60) };
-            let info = PeekInfo::new(PeekKind::Notification, title, line2);
+            let mut info = PeekInfo::new(PeekKind::Notification, title, line2);
+            info.open = Some(n.aumid).filter(|a| !a.is_empty());
             self.start_peek(info, PEEK_MS, now);
         }
     }
@@ -736,6 +859,9 @@ impl App {
         if let Some((_, until)) = &self.peek {
             consider(*until);
         }
+        if let Some((_, t)) = self.lock_check {
+            consider(t);
+        }
         if let Some(t) = self.press_until {
             consider(t);
         }
@@ -799,6 +925,11 @@ impl App {
                 Ev::Key(vk) => self.on_search_key(vk),
                 Ev::LostFocus => self.search_active = false,
                 Ev::Notify => self.on_notify(now),
+                Ev::Volume(pct, muted) => self.on_volume(pct, muted, now),
+                Ev::Brightness(pct) => self.on_brightness(pct, now),
+                Ev::Lock(vk) => self.lock_check = Some((vk, now + LOCK_SETTLE)),
+                Ev::Privacy => self.on_privacy(now),
+                Ev::Bluetooth => self.on_bluetooth(now),
             }
         }
     }
@@ -837,6 +968,14 @@ impl App {
     }
 
     fn on_down(&mut self, btn: Btn, x: f32, y: f32, now: Instant) {
+        if !self.expanded && btn == Btn::Left && self.hot_rect().contains(x, y) {
+            if let Some(aumid) = self.peek_link().map(str::to_string) {
+                win::open_app(&aumid);
+                self.peek = None;
+                self.dirty = true;
+                return;
+            }
+        }
         if !self.expanded {
             // Click mode: the collapsed pill itself receives the click.
             if btn == Btn::Left && self.cfg.expand_on == ExpandOn::Click && self.hot_rect().contains(x, y) {
@@ -1084,6 +1223,9 @@ impl App {
         if c.hotkey != old.hotkey {
             self.win.register_hotkey(c.hotkey);
         }
+        if c.lock_peek != old.lock_peek {
+            self.win.watch_lock_keys(c.lock_peek);
+        }
         if c.album_art != old.album_art {
             let _ = self.media_tx.send(Msg::SetArt(c.album_art));
             if !c.album_art {
@@ -1218,6 +1360,8 @@ impl App {
             frames: self.frames,
             fps_state: self.fps.state,
             ping_ms: self.pinger.ms(),
+            mic_on: self.cfg.privacy_dot && self.in_use.mic.is_some(),
+            cam_on: self.cfg.privacy_dot && self.in_use.cam.is_some(),
         };
         self.marquee = ui::draw(&mut self.cv, &scene);
         self.win.present(self.cv.pm.data());

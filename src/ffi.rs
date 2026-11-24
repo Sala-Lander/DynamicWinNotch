@@ -632,6 +632,88 @@ pub fn cursor_pos() -> (i32, i32) {
     (p.x, p.y)
 }
 
+// Raw keyboard input (Caps / Num Lock peeks), registry change notifications (mic / camera use).
+pub const VK_CAPITAL: u16 = 0x14;
+pub const VK_NUMLOCK: u16 = 0x90;
+pub const WM_KEYUP: u32 = 0x0101;
+pub const WM_SYSKEYDOWN: u32 = 0x0104;
+pub const RID_INPUT: u32 = 0x1000_0003;
+pub const RIM_TYPEKEYBOARD: u32 = 1;
+pub const RIDEV_REMOVE: u32 = 0x1;
+pub const KEY_READ: u32 = 0x2_0019;
+pub const RRF_RT_REG_QWORD: u32 = 0x0000_0048;
+pub const REG_NOTIFY_CHANGE_NAME: u32 = 0x1;
+pub const REG_NOTIFY_CHANGE_LAST_SET: u32 = 0x4;
+
+#[repr(C)]
+#[allow(non_snake_case)]
+pub struct RAWINPUTHEADER {
+    pub dwType: u32,
+    pub dwSize: u32,
+    pub hDevice: HANDLE,
+    pub wParam: usize,
+}
+
+#[repr(C)]
+#[allow(non_snake_case)]
+pub struct RAWKEYBOARD {
+    pub MakeCode: u16,
+    pub Flags: u16,
+    pub Reserved: u16,
+    pub VKey: u16,
+    pub Message: u32,
+    pub ExtraInformation: u32,
+}
+
+#[link(name = "user32")]
+extern "system" {
+    pub fn GetRawInputData(raw: HANDLE, cmd: u32, data: *mut c_void, size: *mut u32, header_size: u32) -> u32;
+    pub fn GetKeyState(vk: i32) -> i16;
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    pub fn RegOpenKeyExW(key: HANDLE, subkey: *const u16, options: u32, sam: u32, out: *mut HANDLE) -> i32;
+    pub fn RegCloseKey(key: HANDLE) -> i32;
+    pub fn RegEnumKeyExW(
+        key: HANDLE,
+        index: u32,
+        name: *mut u16,
+        cch_name: *mut u32,
+        reserved: *mut u32,
+        class: *mut u16,
+        cch_class: *mut u32,
+        last_write: *mut FILETIME,
+    ) -> i32;
+    pub fn RegNotifyChangeKeyValue(key: HANDLE, subtree: i32, filter: u32, event: HANDLE, asynchronous: i32) -> i32;
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    pub fn CreateEventW(attrs: *const c_void, manual_reset: i32, initial: i32, name: *const u16) -> HANDLE;
+    pub fn WaitForMultipleObjects(count: u32, handles: *const HANDLE, wait_all: i32, ms: u32) -> u32;
+}
+
+// Brightness peek: power-setting notification for the current monitor brightness.
+pub const PBT_POWERSETTINGCHANGE: usize = 0x8013;
+pub const DEVICE_NOTIFY_WINDOW_HANDLE: u32 = 0;
+/// GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS {8ffee2c6-2d01-46be-adb9-398addc5b4ff}: percent.
+pub const GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS: GUID =
+    GUID { data1: 0x8FFE_E2C6, data2: 0x2D01, data3: 0x46BE, data4: [0xAD, 0xB9, 0x39, 0x8A, 0xDD, 0xC5, 0xB4, 0xFF] };
+
+#[repr(C)]
+#[allow(non_snake_case)]
+pub struct POWERBROADCAST_SETTING {
+    pub PowerSetting: GUID,
+    pub DataLength: u32,
+    pub Data: [u8; 1],
+}
+
+#[link(name = "user32")]
+extern "system" {
+    pub fn RegisterPowerSettingNotification(recipient: HANDLE, setting: *const GUID, flags: u32) -> HANDLE;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,6 +730,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<SYSTEM_POWER_STATUS>(), 12);
         assert_eq!(std::mem::size_of::<MONITORINFO>(), 40);
         assert_eq!(std::mem::size_of::<RAWINPUTDEVICE>(), 16);
+        assert_eq!(std::mem::size_of::<RAWINPUTHEADER>(), 24);
+        assert_eq!(std::mem::size_of::<RAWKEYBOARD>(), 16);
         assert_eq!(std::mem::size_of::<NOTIFYICONDATAW>(), 976);
         assert_eq!(std::mem::size_of::<EVENT_TRACE_PROPERTIES>(), 120);
         assert_eq!(std::mem::size_of::<EVENT_HEADER>(), 80);
