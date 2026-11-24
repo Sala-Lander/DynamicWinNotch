@@ -134,7 +134,32 @@ struct Worker {
     track_id: u64,
     have_art: bool,
     art_tries: u32,
+    /// Fingerprint + album of the cover shown for the previous track: a player that publishes
+    /// the new title before the new thumbnail still hands out the old cover for a moment.
+    prev_art: Option<(u64, String)>,
+    cur_art: Option<(u64, String)>,
     playing: bool,
+}
+
+/// Cover retries for a new track (one every `ART_RETRY`), before giving up / accepting.
+const ART_TRIES: u32 = 6;
+const ART_RETRY: Duration = Duration::from_millis(400);
+
+fn art_hash(a: &Art) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    a.side.hash(&mut h);
+    a.rgba.hash(&mut h);
+    h.finish()
+}
+
+/// Is a freshly loaded cover just the previous track's cover still being served? Same album
+/// legitimately shares the cover; the last try accepts whatever the player offers.
+pub fn stale_cover(prev: Option<&(u64, String)>, hash: u64, album: &str, last_try: bool) -> bool {
+    match prev {
+        Some((h, prev_album)) => *h == hash && !last_try && (album.is_empty() || album != prev_album),
+        None => false,
+    }
 }
 
 fn run(hwnd: HANDLE, tx: Sender<Msg>, rx: Receiver<Msg>, shared: Arc<Mutex<Shared>>, want_art: bool) {
@@ -161,12 +186,20 @@ fn run(hwnd: HANDLE, tx: Sender<Msg>, rx: Receiver<Msg>, shared: Arc<Mutex<Share
         track_id: 0,
         have_art: false,
         art_tries: 0,
+        prev_art: None,
+        cur_art: None,
         playing: false,
     };
     w.refresh();
     loop {
         // Events wake us instantly; the timeout only re-syncs the position of a playing track.
-        let wait = if w.playing { Duration::from_secs(10) } else { Duration::from_secs(60) };
+        let wait = if w.art_pending() {
+            ART_RETRY
+        } else if w.playing {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_secs(60)
+        };
         match rx.recv_timeout(wait) {
             Ok(Msg::Quit) | Err(RecvTimeoutError::Disconnected) => break,
             Ok(Msg::Cmd(c)) => {
@@ -194,6 +227,10 @@ fn run(hwnd: HANDLE, tx: Sender<Msg>, rx: Receiver<Msg>, shared: Arc<Mutex<Share
 }
 
 impl Worker {
+    fn art_pending(&self) -> bool {
+        self.want_art && !self.have_art && !self.last_key.is_empty() && self.art_tries < ART_TRIES
+    }
+
     fn set_art(&mut self, on: bool) {
         self.want_art = on;
         if on {
@@ -204,7 +241,9 @@ impl Worker {
     }
 
     fn command(&mut self, c: Cmd) {
-        let Ok(s) = self.manager.GetCurrentSession() else { return };
+        let Ok(s) = self.manager.GetCurrentSession() else {
+            return;
+        };
         match c {
             Cmd::TogglePlay => {
                 let _ = s.TryTogglePlayPauseAsync();
@@ -324,25 +363,33 @@ impl Worker {
             info.can_seek = c.IsPlaybackPositionEnabled().unwrap_or(false);
         }
 
-        if let Ok(props) = s.TryGetMediaPropertiesAsync().and_then(|op| op.get()) {
-            info.title = props.Title().map(|h| h.to_string()).unwrap_or_default();
-            info.artist = props.Artist().map(|h| h.to_string()).unwrap_or_default();
-            info.album = props.AlbumTitle().map(|h| h.to_string()).unwrap_or_default();
-
-            let key = format!("{}\u{1}{}\u{1}{}\u{1}{}", info.app, info.title, info.artist, info.album);
-            if key != self.last_key {
-                self.last_key = key;
-                self.track_id += 1;
-                self.have_art = false;
-                self.art_tries = 0;
-                if self.want_art {
-                    *art_update = Some(None); // never show the previous track's cover
-                }
+        // A failed read counts as "no metadata": never keep the previous track's text or cover.
+        let props = s.TryGetMediaPropertiesAsync().and_then(|op| op.get()).ok();
+        if let Some(p) = &props {
+            info.title = p.Title().map(|h| h.to_string()).unwrap_or_default();
+            info.artist = p.Artist().map(|h| h.to_string()).unwrap_or_default();
+            info.album = p.AlbumTitle().map(|h| h.to_string()).unwrap_or_default();
+        }
+        let key = format!("{}\u{1}{}\u{1}{}\u{1}{}", info.app, info.title, info.artist, info.album);
+        if key != self.last_key {
+            self.last_key = key;
+            self.track_id += 1;
+            self.have_art = false;
+            self.art_tries = 0;
+            if self.cur_art.is_some() {
+                self.prev_art = self.cur_art.take();
             }
-            // Players often publish the thumbnail a moment after the text: retry a few times.
-            if self.want_art && !self.have_art && self.art_tries < 3 {
-                self.art_tries += 1;
-                if let Some(a) = load_art(&props) {
+            if self.want_art {
+                *art_update = Some(None); // never show the previous track's cover
+            }
+        }
+        // Players often publish the thumbnail a moment after the text: retry for a few seconds.
+        if let Some(p) = props.as_ref().filter(|_| self.want_art && !self.have_art && self.art_tries < ART_TRIES) {
+            self.art_tries += 1;
+            if let Some(a) = load_art(p) {
+                let h = art_hash(&a);
+                if !stale_cover(self.prev_art.as_ref(), h, &info.album, self.art_tries >= ART_TRIES) {
+                    self.cur_art = Some((h, info.album.clone()));
                     *art_update = Some(Some(a));
                     self.have_art = true;
                 }
@@ -417,4 +464,20 @@ fn load_art(props: &MediaProps) -> Option<Art> {
     let rgba = resample_box(&square, side, side, ART_SIDE, ART_SIDE);
     let (r, g, b) = avg_color_premul(&rgba);
     Some(Art { rgba, side: ART_SIDE, accent: accent_from_avg(r, g, b) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_cover_rules() {
+        let prev = (42u64, "Album A".to_string());
+        assert!(stale_cover(Some(&prev), 42, "Album B", false)); // old cover, new album: wait
+        assert!(stale_cover(Some(&prev), 42, "", false)); // unknown album: wait
+        assert!(!stale_cover(Some(&prev), 42, "Album A", false)); // same album shares the cover
+        assert!(!stale_cover(Some(&prev), 7, "Album B", false)); // a different cover
+        assert!(!stale_cover(Some(&prev), 42, "Album B", true)); // last try accepts
+        assert!(!stale_cover(None, 42, "", false));
+    }
 }

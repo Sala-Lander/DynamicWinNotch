@@ -9,7 +9,7 @@
 //! 4-second housekeeping tick.
 
 use crate::clip::{self, ClipCmd, ClipFlags, ClipItem};
-use crate::config::{self, Config, ExpandOn, FullscreenMode};
+use crate::config::{self, gb, Config, ExpandOn, FullscreenMode};
 use crate::ffi::{MessageBeep, PostQuitMessage, MB_ICONASTERISK, VK_BACK, VK_ESCAPE, VK_RETURN, WM_LBUTTONUP, WM_RBUTTONUP};
 use crate::gfx::{pixmap_from_rgba, Canvas};
 use crate::history::{Entry, History, Kind};
@@ -26,6 +26,7 @@ use crate::timer::{add_reminder, next_reminder_wake, take_due, Stopwatch, Timer,
 use crate::ui::{self, PeekInfo, PeekKind, PowerIcon, Scene, TimerMode, TimerView};
 use crate::util::{clamp01, fmt_bytes, single_line};
 use crate::win::{self, Btn, Ev, Tray, Win};
+use crate::{fps, ping};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -86,6 +87,9 @@ pub struct App {
     clip_rx: Receiver<ClipItem>,
     clip_flags: Arc<ClipFlags>,
     sampler: Sampler,
+    fps: fps::Tracker,
+    frames: Option<fps::FrameStats>,
+    pinger: ping::Pinger,
     timer: Timer,
     timer_mode: TimerMode,
     stopwatch: Stopwatch,
@@ -103,6 +107,8 @@ pub struct App {
     notify_tx: Sender<notify::Msg>,
     notify_shared: Arc<Mutex<notify::Shared>>,
     notify_seen_gen: u64,
+    /// The "notifications blocked" hint was already shown since peeks were switched on.
+    notify_hint_shown: bool,
 
     /// Click-through "game bar" shown over full-screen apps when `fullscreen_mode` is
     /// `GameBar` instead of the normal hide behaviour.
@@ -146,7 +152,7 @@ impl App {
         let _ = clip_tx.send(ClipCmd::Read); // seed the history with whatever is on the clipboard now
         // Best-effort: silently does nothing if access to the notification listener is denied
         // (common for an unpackaged .exe) - see notify.rs.
-        let (notify_tx, notify_shared) = notify::spawn(win.hwnd);
+        let (notify_tx, notify_shared) = notify::spawn(win.hwnd, cfg.notifications);
 
         let now = Instant::now();
         let tab = cfg.start_tab;
@@ -186,6 +192,9 @@ impl App {
             clip_rx,
             clip_flags,
             sampler: Sampler::new(),
+            fps: fps::Tracker::new(),
+            frames: None,
+            pinger: ping::Pinger::new(),
             timer: Timer::default(),
             timer_mode: TimerMode::default(),
             stopwatch: Stopwatch::default(),
@@ -198,6 +207,7 @@ impl App {
             search: String::new(),
             search_active: false,
             notify_tx,
+            notify_hint_shown: false,
             notify_shared,
             notify_seen_gen: 0,
             game_bar: false,
@@ -466,13 +476,27 @@ impl App {
 
     // ------------------------------------------------------------- sampling
     fn sample_now(&mut self) {
+        self.update_game_workers();
         self.sampler.sample();
+        self.frames = self.fps.stats();
         self.last_sample = Instant::now();
         let s = &self.sampler.stats;
         self.gauge[0].set_target(s.cpu / 100.0);
         self.gauge[1].set_target(s.ram_pct / 100.0);
         self.gauge[2].set_target(s.battery.map_or(0.0, |b| b as f32 / 100.0));
         self.dirty = true;
+    }
+
+    /// Network counters follow the "Live network speed" setting; the ETW frame tracker and the
+    /// pinger only run while the game bar is on screen and shows their readout.
+    fn update_game_workers(&mut self) {
+        let items = self.cfg.game_items;
+        self.sampler.set_net(self.cfg.net_speed);
+        self.fps.set(self.game_bar && items & gb::FRAMES != 0);
+        self.pinger.set(self.game_bar && items & gb::PING != 0, &self.cfg.ping_host);
+        if self.fps.state != fps::State::Running {
+            self.frames = None;
+        }
     }
 
     // --------------------------------------------------------------- timers
@@ -592,10 +616,22 @@ impl App {
 
     // --------------------------------------------------------- notifications
     fn on_notify(&mut self, now: Instant) {
-        let (gen, notif) = {
+        let (gen, notif, access) = {
             let g = self.notify_shared.lock().unwrap_or_else(|e| e.into_inner());
-            (g.generation, g.latest.clone())
+            (g.generation, g.latest.clone(), g.access)
         };
+        let blocked = matches!(access, notify::Access::Denied | notify::Access::Unsupported);
+        if self.cfg.notifications && blocked && !self.notify_hint_shown {
+            self.notify_hint_shown = true;
+            let line2 = if access == notify::Access::Denied {
+                "Allow it: Settings \u{203a} Privacy \u{203a} Notifications \u{203a} desktop apps"
+            } else {
+                "This Windows version has no notification listener"
+            };
+            let info =
+                PeekInfo::new(PeekKind::Notification, "Notification access blocked".to_string(), line2.to_string());
+            self.start_peek(info, PEEK_MS * 2, now);
+        }
         if gen == self.notify_seen_gen {
             return;
         }
@@ -619,6 +655,7 @@ impl App {
             FullscreenMode::GameBar => {
                 if fullscreen != self.game_bar {
                     self.game_bar = fullscreen;
+                    self.update_game_workers();
                     self.dirty = true;
                 }
                 if self.fs_hidden {
@@ -630,6 +667,7 @@ impl App {
             FullscreenMode::Hide => {
                 if self.game_bar {
                     self.game_bar = false;
+                    self.update_game_workers();
                     self.dirty = true;
                 }
                 if fullscreen != self.fs_hidden {
@@ -1007,7 +1045,9 @@ impl App {
 
     // ------------------------------------------------------------- settings
     fn on_setting(&mut self, row: usize, sub: usize, now: Instant) {
-        let Some(r) = settings::ROWS.get(row) else { return };
+        let Some(r) = settings::ROWS.get(row) else {
+            return;
+        };
         let old = self.cfg.clone();
         match settings::apply(&mut self.cfg, self.autostart, r.id, sub) {
             Action::Nothing => {}
@@ -1053,6 +1093,14 @@ impl App {
                 let _ = self.media_tx.send(Msg::Refresh);
             }
         }
+        if c.notifications != old.notifications {
+            let _ = self.notify_tx.send(notify::Msg::Enable(c.notifications));
+            self.notify_hint_shown = false;
+            if c.notifications {
+                self.on_notify(Instant::now()); // access may already be known to be blocked
+            }
+        }
+        self.update_game_workers();
         // Keep the Settings page inside its range if the history shrank, etc.
         self.scroll_target = self.scroll_target.min(self.clip.len().saturating_sub(VISIBLE_ROWS) as f32);
         self.trimmed = false;
@@ -1167,6 +1215,9 @@ impl App {
             search: &self.search,
             search_active: self.search_active,
             game_bar: self.game_bar,
+            frames: self.frames,
+            fps_state: self.fps.state,
+            ping_ms: self.pinger.ms(),
         };
         self.marquee = ui::draw(&mut self.cv, &scene);
         self.win.present(self.cv.pm.data());
