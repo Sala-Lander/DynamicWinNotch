@@ -115,7 +115,13 @@ pub const GAME_BAR: (f32, f32) = (150.0, 22.0);
 /// The game bar, centred at the top edge (it never uses `Style`: it is flush with the edge
 /// either way, since nothing should draw attention by floating).
 pub fn game_bar_rect() -> Rect {
-    Rect::new((WIN_W - GAME_BAR.0) * 0.5, 0.0, GAME_BAR.0, GAME_BAR.1)
+    game_bar_rect_w(GAME_BAR.0)
+}
+
+/// The game bar grown to fit `w` px of readouts (never narrower than `GAME_BAR`).
+pub fn game_bar_rect_w(w: f32) -> Rect {
+    let w = w.clamp(GAME_BAR.0, WIN_W - 8.0);
+    Rect::new((WIN_W - w) * 0.5, 0.0, w, GAME_BAR.1)
 }
 
 pub fn margin_top(style: Style) -> f32 {
@@ -395,6 +401,8 @@ mod tests {
         assert!((r.cx() - WIN_W * 0.5).abs() < 0.01);
         assert_eq!(r.y, 0.0);
         assert!(r.w < COLLAPSED.0 && r.h < COLLAPSED.1);
+        let wide = game_bar_rect_w(9999.0);
+        assert!((wide.cx() - WIN_W * 0.5).abs() < 0.01 && wide.x >= 4.0);
     }
 
     #[test]

@@ -323,6 +323,8 @@ extern "system" {
     pub fn GetDpiForSystem() -> u32;
     pub fn GetDpiForWindow(hwnd: HANDLE) -> u32;
     pub fn SetProcessDpiAwarenessContext(ctx: isize) -> i32;
+    pub fn GetForegroundWindow() -> HANDLE;
+    pub fn GetWindowThreadProcessId(hwnd: HANDLE, pid: *mut u32) -> u32;
 }
 
 #[link(name = "gdi32")]
@@ -404,7 +406,7 @@ extern "system" {
 
 // PDH: used for the GPU and network-speed gauges (wildcard counters summed across instances).
 pub const PDH_FMT_DOUBLE: u32 = 0x0000_0200;
-pub const PDH_MORE_DATA: i32 = 0x8000_7D2u32 as i32;
+pub const PDH_MORE_DATA: i32 = 0x8000_07D2u32 as i32;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -444,8 +446,165 @@ extern "system" {
     pub fn PdhCloseQuery(query: isize) -> u32;
 }
 
+// ETW: real-time trace session for the game bar's FPS counter (DXGI / D3D9 present events).
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct GUID {
+    pub data1: u32,
+    pub data2: u16,
+    pub data3: u16,
+    pub data4: [u8; 8],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct WNODE_HEADER {
+    pub BufferSize: u32,
+    pub ProviderId: u32,
+    pub HistoricalContext: u64,
+    pub TimeStamp: i64,
+    pub Guid: GUID,
+    pub ClientContext: u32,
+    pub Flags: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct EVENT_TRACE_PROPERTIES {
+    pub Wnode: WNODE_HEADER,
+    pub BufferSize: u32,
+    pub MinimumBuffers: u32,
+    pub MaximumBuffers: u32,
+    pub MaximumFileSize: u32,
+    pub LogFileMode: u32,
+    pub FlushTimer: u32,
+    pub EnableFlags: u32,
+    pub AgeLimit: i32,
+    pub NumberOfBuffers: u32,
+    pub FreeBuffers: u32,
+    pub EventsLost: u32,
+    pub BuffersWritten: u32,
+    pub LogBuffersLost: u32,
+    pub RealTimeBuffersLost: u32,
+    pub LoggerThreadId: HANDLE,
+    pub LogFileNameOffset: u32,
+    pub LoggerNameOffset: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EVENT_DESCRIPTOR {
+    pub Id: u16,
+    pub Version: u8,
+    pub Channel: u8,
+    pub Level: u8,
+    pub Opcode: u8,
+    pub Task: u16,
+    pub Keyword: u64,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EVENT_HEADER {
+    pub Size: u16,
+    pub HeaderType: u16,
+    pub Flags: u16,
+    pub EventProperty: u16,
+    pub ThreadId: u32,
+    pub ProcessId: u32,
+    pub TimeStamp: i64,
+    pub ProviderId: GUID,
+    pub EventDescriptor: EVENT_DESCRIPTOR,
+    pub ProcessorTime: u64,
+    pub ActivityId: GUID,
+}
+#[repr(C)]
+pub struct EVENT_RECORD {
+    pub EventHeader: EVENT_HEADER,
+    pub BufferContext: u32,
+    pub ExtendedDataCount: u16,
+    pub UserDataLength: u16,
+    pub ExtendedData: *mut c_void,
+    pub UserData: *mut c_void,
+    pub UserContext: *mut c_void,
+}
+pub type EventRecordCallback = unsafe extern "system" fn(*mut EVENT_RECORD);
+/// EVENT_TRACE_LOGFILEW. `CurrentEvent` (EVENT_TRACE, 88 bytes) and `LogfileHeader`
+/// (TRACE_LOGFILE_HEADER, 280 bytes) are output-only and modelled as opaque, 8-aligned blobs.
+#[repr(C)]
+pub struct EVENT_TRACE_LOGFILEW {
+    pub LogFileName: *mut u16,
+    pub LoggerName: *mut u16,
+    pub CurrentTime: i64,
+    pub BuffersRead: u32,
+    pub ProcessTraceMode: u32,
+    pub CurrentEvent: [u64; 11],
+    pub LogfileHeader: [u64; 35],
+    pub BufferCallback: *mut c_void,
+    pub BufferSize: u32,
+    pub Filled: u32,
+    pub EventsLost: u32,
+    pub EventRecordCallback: Option<EventRecordCallback>,
+    pub IsKernelTrace: u32,
+    pub Context: *mut c_void,
+}
+pub const WNODE_FLAG_TRACED_GUID: u32 = 0x0002_0000;
+pub const EVENT_TRACE_REAL_TIME_MODE: u32 = 0x0000_0100;
+pub const EVENT_TRACE_CONTROL_STOP: u32 = 1;
+pub const EVENT_CONTROL_CODE_ENABLE_PROVIDER: u32 = 1;
+pub const TRACE_LEVEL_INFORMATION: u8 = 4;
+pub const PROCESS_TRACE_MODE_REAL_TIME: u32 = 0x0000_0100;
+pub const PROCESS_TRACE_MODE_EVENT_RECORD: u32 = 0x1000_0000;
+pub const EVENT_HEADER_FLAG_32_BIT_HEADER: u16 = 0x0020;
+pub const INVALID_PROCESSTRACE_HANDLE: u64 = u64::MAX;
+pub const ERROR_ACCESS_DENIED: u32 = 5;
+
+#[link(name = "advapi32")]
+extern "system" {
+    pub fn StartTraceW(handle: *mut u64, name: *const u16, props: *mut EVENT_TRACE_PROPERTIES) -> u32;
+    pub fn ControlTraceW(handle: u64, name: *const u16, props: *mut EVENT_TRACE_PROPERTIES, code: u32) -> u32;
+    pub fn EnableTraceEx2(
+        handle: u64,
+        provider: *const GUID,
+        code: u32,
+        level: u8,
+        match_any: u64,
+        match_all: u64,
+        timeout: u32,
+        params: *const c_void,
+    ) -> u32;
+    pub fn OpenTraceW(logfile: *mut EVENT_TRACE_LOGFILEW) -> u64;
+    pub fn ProcessTrace(handles: *const u64, count: u32, start: *const FILETIME, end: *const FILETIME) -> u32;
+    pub fn CloseTrace(handle: u64) -> u32;
+}
+
+// ICMP echo, for the game bar's ping readout (no admin rights needed).
+#[link(name = "iphlpapi")]
+extern "system" {
+    pub fn IcmpCreateFile() -> HANDLE;
+    pub fn IcmpCloseHandle(h: HANDLE) -> i32;
+    pub fn IcmpSendEcho(
+        h: HANDLE,
+        dest: u32,
+        data: *const c_void,
+        data_len: u16,
+        options: *const c_void,
+        reply: *mut c_void,
+        reply_len: u32,
+        timeout_ms: u32,
+    ) -> u32;
+}
+
 // ---------------------------------------------------------------- helpers
 /// NUL-terminated UTF-16 for passing strings to the `W` APIs.
+/// Read a NUL-terminated UTF-16 string (empty for null).
+pub unsafe fn from_wide_ptr(p: *const u16) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    let mut n = 0;
+    while *p.add(n) != 0 {
+        n += 1;
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(p, n))
+}
+
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -488,6 +647,11 @@ mod tests {
         assert_eq!(std::mem::size_of::<MONITORINFO>(), 40);
         assert_eq!(std::mem::size_of::<RAWINPUTDEVICE>(), 16);
         assert_eq!(std::mem::size_of::<NOTIFYICONDATAW>(), 976);
+        assert_eq!(std::mem::size_of::<EVENT_TRACE_PROPERTIES>(), 120);
+        assert_eq!(std::mem::size_of::<EVENT_HEADER>(), 80);
+        assert_eq!(std::mem::size_of::<EVENT_RECORD>(), 112);
+        assert_eq!(std::mem::size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>(), 24);
+        assert_eq!(std::mem::size_of::<EVENT_TRACE_LOGFILEW>(), 448);
     }
 
     #[test]

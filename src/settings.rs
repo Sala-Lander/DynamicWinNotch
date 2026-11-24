@@ -2,7 +2,7 @@
 //! sits and what a click on it does to the `Config`. No OS calls and no drawing, so the whole
 //! thing is unit-tested; `ui.rs` paints it and `layout.rs` hit-tests it from the same numbers.
 
-use crate::config::{Config, ExpandOn, FullscreenMode};
+use crate::config::{gb, Config, ExpandOn, FullscreenMode};
 use crate::layout::{Rect, Style, ROW_H};
 
 /// Accent swatches offered in the UI (sub-control 0 is "auto", 1.. map to these).
@@ -10,6 +10,10 @@ pub const ACCENTS: [(u8, u8, u8); 6] =
     [(122, 168, 255), (48, 209, 88), (255, 159, 10), (255, 95, 160), (191, 90, 242), (255, 69, 58)];
 
 pub const FPS_STEPS: [u32; 3] = [30, 60, 120];
+
+/// Game-bar readouts behind the two chip rows, in chip order.
+pub const GB_FRAMES: [u16; 4] = [gb::FPS, gb::LOW1, gb::LOW01, gb::FRAMETIME];
+pub const GB_SYSTEM: [u16; 5] = [gb::CPU, gb::GPU, gb::RAM, gb::PING, gb::NET];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Id {
@@ -31,6 +35,9 @@ pub enum Id {
     ConfigFile,
     Notifications,
     FullscreenMode,
+    GameFrames,
+    GameSystem,
+    NetSpeed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +49,8 @@ pub enum Ctl {
     Swatch,
     /// `-` value `+`.
     Step,
+    /// Multi-select chips (any number on).
+    Chips(&'static [&'static str]),
     /// Plain buttons (no selected state).
     Buttons(&'static [&'static str]),
 }
@@ -53,7 +62,7 @@ pub struct Row {
     pub ctl: Ctl,
 }
 
-pub const ROWS: [Row; 18] = [
+pub const ROWS: [Row; 21] = [
     Row { id: Id::ExpandOn, label: "Expand on", ctl: Ctl::Seg(&["Hover", "Click"]) },
     Row { id: Id::Style, label: "Style", ctl: Ctl::Seg(&["Notch", "Island"]) },
     Row { id: Id::Accent, label: "Accent colour", ctl: Ctl::Swatch },
@@ -68,13 +77,17 @@ pub const ROWS: [Row; 18] = [
     Row { id: Id::HistorySize, label: "Clipboard history", ctl: Ctl::Step },
     Row { id: Id::HideFullscreen, label: "Hide in full screen", ctl: Ctl::Toggle },
     Row { id: Id::FullscreenMode, label: "Full screen behaviour", ctl: Ctl::Seg(&["Hide", "Game bar"]) },
+    Row { id: Id::GameFrames, label: "Game bar: frames", ctl: Ctl::Chips(&["FPS", "1%", "0.1%", "ms"]) },
+    Row { id: Id::GameSystem, label: "Game bar: system", ctl: Ctl::Chips(&["CPU", "GPU", "RAM", "Ping", "Net"]) },
     Row { id: Id::HoverDelay, label: "Hover delay", ctl: Ctl::Step },
     Row { id: Id::Fps, label: "Frame rate", ctl: Ctl::Seg(&["30", "60", "120"]) },
+    Row { id: Id::NetSpeed, label: "Live network speed", ctl: Ctl::Toggle },
     Row { id: Id::Autostart, label: "Start with Windows", ctl: Ctl::Toggle },
     Row { id: Id::ConfigFile, label: "Config file", ctl: Ctl::Buttons(&["Open", "Reload"]) },
 ];
 
 const CTL_H: f32 = 20.0;
+const CHIP_W: f32 = 42.0;
 
 fn seg_w(labels: &[&str]) -> f32 {
     if labels.iter().all(|l| l.len() <= 3) {
@@ -101,6 +114,14 @@ pub fn sub_rects(ctl: Ctl, right: f32, y: f32) -> ([Rect; 8], usize) {
                 out[i] = Rect::new(x0 + i as f32 * w, ty, w, CTL_H);
             }
             labels.len().min(8)
+        }
+        Ctl::Chips(labels) => {
+            let n = labels.len().min(8);
+            let x0 = right - CHIP_W * n as f32;
+            for i in 0..n {
+                out[i] = Rect::new(x0 + i as f32 * CHIP_W, ty, CHIP_W, CTL_H);
+            }
+            n
         }
         Ctl::Swatch => {
             // Auto + six colours, 20 px pitch.
@@ -161,6 +182,7 @@ pub fn toggle_on(id: Id, v: &View) -> bool {
         Id::Privacy => c.privacy_filter,
         Id::HideFullscreen => c.hide_fullscreen,
         Id::Notifications => c.notifications,
+        Id::NetSpeed => c.net_speed,
         Id::Autostart => v.autostart,
         _ => false,
     }
@@ -175,6 +197,19 @@ pub fn seg_selected(id: Id, c: &Config) -> Option<usize> {
         Id::FullscreenMode => Some((c.fullscreen_mode == FullscreenMode::GameBar) as usize),
         _ => None,
     }
+}
+
+fn chip_bits(id: Id) -> &'static [u16] {
+    match id {
+        Id::GameFrames => &GB_FRAMES,
+        Id::GameSystem => &GB_SYSTEM,
+        _ => &[],
+    }
+}
+
+/// Is chip `k` of row `id` switched on?
+pub fn chip_on(id: Id, c: &Config, k: usize) -> bool {
+    chip_bits(id).get(k).is_some_and(|b| c.game_items & b != 0)
 }
 
 /// Selected swatch: 0 = auto, 1.. = `ACCENTS`, `None` = a custom colour from the file.
@@ -224,6 +259,12 @@ pub fn apply(c: &mut Config, autostart: bool, id: Id, sub: usize) -> Action {
         Id::TimerSound => c.timer_sound = !c.timer_sound,
         Id::ClipImages => c.clip_images = !c.clip_images,
         Id::Notifications => c.notifications = !c.notifications,
+        Id::NetSpeed => c.net_speed = !c.net_speed,
+        Id::GameFrames | Id::GameSystem => {
+            if let Some(b) = chip_bits(id).get(sub) {
+                c.game_items ^= b;
+            }
+        }
         Id::Privacy => c.privacy_filter = !c.privacy_filter,
         Id::HideFullscreen => c.hide_fullscreen = !c.hide_fullscreen,
         Id::FullscreenMode => c.fullscreen_mode = if sub == 1 { FullscreenMode::GameBar } else { FullscreenMode::Hide },
@@ -360,6 +401,21 @@ mod tests {
         assert_eq!(c.fullscreen_mode, FullscreenMode::GameBar);
         assert_eq!(seg_selected(Id::FullscreenMode, &c), Some(1));
         assert_eq!(apply(&mut c, false, Id::FullscreenMode, 1), Action::Nothing);
+    }
+
+    #[test]
+    fn chips_flip_game_items() {
+        let mut c = Config::default();
+        assert!(chip_on(Id::GameFrames, &c, 0)); // FPS on by default
+        assert!(!chip_on(Id::GameSystem, &c, 3)); // ping off by default
+        assert_eq!(apply(&mut c, false, Id::GameSystem, 3), Action::Changed);
+        assert!(c.game_items & gb::PING != 0);
+        assert_eq!(apply(&mut c, false, Id::GameFrames, 0), Action::Changed);
+        assert!(c.game_items & gb::FPS == 0);
+        assert_eq!(apply(&mut c, false, Id::GameFrames, 9), Action::Nothing);
+        assert!(toggle_on(Id::NetSpeed, &View { cfg: &c, autostart: false }));
+        apply(&mut c, false, Id::NetSpeed, 0);
+        assert!(!c.net_speed);
     }
 
     #[test]

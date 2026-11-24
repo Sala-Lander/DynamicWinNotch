@@ -8,9 +8,9 @@ small control surface with five tabs.
 |---|---|
 | **Media** | Whatever is playing in *any* app (Spotify, browsers, Media Player, ...) via Windows' Global System Media Transport Controls: cover art, title, artist, progress bar (click to seek), previous / play-pause / next. |
 | **Clipboard** | History of everything you copy: **text, links** (host highlighted), **colours** (`#RRGGBB`, `rgb(...)` get a swatch), **files** (Explorer copies) and **images** (thumbnail in the row; screenshots, "Copy image" in a browser, ...). A **search box** at the top filters the list live (case-insensitive, matches the preview text). Click a row to copy it back (images go back as images), right-click to pin, middle-click to delete, wheel to scroll, "Clear" to wipe unpinned items. |
-| **System** | CPU, GPU, memory and battery as live ring gauges, plus thread count, used/total RAM, charge state and current **network throughput** (down / up, auto-scaled B·s⁻¹ / KB·s⁻¹ / MB·s⁻¹). |
+| **System** | CPU, GPU, memory and battery as live ring gauges, plus thread count, used/total RAM, charge state and live **network throughput** (down / up, auto-scaled B·s⁻¹ / KB·s⁻¹ / MB·s⁻¹; switchable with *Live network speed*). |
 | **Timer** | Three modes, cycled with the header's mode label (where "Clear" sits on the Clipboard tab): **Countdown** (presets, start / pause / reset, +-1 min, wheel to adjust; peeks and sounds at zero), **Stopwatch** (start / pause / reset, counts up), **Reminders** (quick-add +10 / +30 / +60 min, up to 5 pending at once, "Clear all"; each one peeks and sounds when it comes due). |
-| **Settings** | Every option in the island itself: expand mode, style, accent colour swatches, toggles (album art, equalizer, peeks, battery alerts, timer sound, clipboard images, notification peeks, password-manager filter, full-screen hiding, start with Windows), a full-screen behaviour switch (hide / game bar), steppers (history size, hover delay), frame rate. Changes apply immediately and are saved to `config.ini`. |
+| **Settings** | Every option in the island itself: expand mode, style, accent colour swatches, toggles (album art, equalizer, peeks, battery alerts, timer sound, clipboard images, notification peeks, password-manager filter, full-screen hiding, start with Windows), a full-screen behaviour switch (hide / game bar), game-bar readout chips (FPS, 1 %, 0.1 %, frame time / CPU, GPU, RAM, ping, network), live network speed, steppers (history size, hover delay), frame rate. Changes apply immediately and are saved to `config.ini`. |
 
 Native Win32 layered window + `tiny-skia` software rendering. No webview, no GPU framework,
 no Electron/Tauri runtime, no polling loop.
@@ -39,7 +39,9 @@ detection, settings model, timer, battery-alert logic, config round-trip and hel
   charged), and - best-effort, see **Limitations** - on a new Windows toast notification.
 * While a full-screen app, game or presentation is running, the island either hides itself or, if
   `fullscreen_mode` is set to **game bar**, shrinks into a tiny click-through bar at the top of the
-  screen showing CPU / GPU / RAM, which ignores the mouse entirely and never expands.
+  screen, which ignores the mouse entirely and never expands. Its readouts are picked with the
+  *Game bar* chips in Settings: **FPS**, **1 % low**, **0.1 % low**, **frame time** (ms), CPU / GPU /
+  RAM rings, **ping** (to `ping_host`) and network down / up. The bar grows to fit what is enabled.
 * Wheel over the tab strip switches tabs.
 
 ## Configuration
@@ -51,7 +53,9 @@ created on first run and rewritten (with comments) whenever you change a setting
 `clip_images`, `image_budget_mb` (compressed-image memory budget, 8-512), `album_art`, `equalizer`,
 `auto_peek`, `power_alerts`, `timer_sound`, `privacy_filter`, `hotkey`, `hide_fullscreen`, `fps_cap`,
 `notifications` (toast-notification peeks, best-effort - see **Limitations**), `fullscreen_mode`
-(`hide` or `gamebar`, what `hide_fullscreen` switches to when triggered), `accent` (`auto` = from the
+(`hide` or `gamebar`, what `hide_fullscreen` switches to when triggered), `gamebar_items`
+(comma list of `fps,low1,low01,frametime,cpu,gpu,ram,ping,net`, or `none`), `ping_host` (default
+`1.1.1.1`), `net_speed` (live network throughput, 1/0), `accent` (`auto` = from the
 cover art, or `#RRGGBB`). `start_tab` also accepts `timer` and `settings`.
 Existing config files keep working; missing keys use their defaults.
 
@@ -112,16 +116,18 @@ back). Images are captured when no text is on the clipboard (spreadsheet cells g
 Media controls act on the session Windows
 considers current (the same one the volume flyout shows). Not code-signed, so SmartScreen may warn on first run.
 
-**Notification peeks are best-effort and may simply do nothing.** They go through WinRT's
-`UserNotificationListener`, which is designed for apps with MSIX package identity; this is a plain
-unpackaged `.exe`, so `RequestAccessAsync` is commonly denied outright with no further event to react
-to. When that happens the island quietly never peeks on a notification - it does not retry, does not
-pop an error, and nothing else is affected. If access *is* granted (observed on some systems for
-unpackaged exes that already have a taskbar presence) it behaves like any other peek.
+**Notification peeks need Windows' permission.** They go through WinRT's `UserNotificationListener`.
+Turn on *Settings > Privacy & security > Notifications > Let apps / desktop apps access your
+notifications*; while that is off the island shows a one-time "Notification access blocked" peek and
+re-checks every 15 s, so no restart is needed after allowing it. Unpackaged apps usually cannot
+subscribe to the live notification event, so while peeks are on the island polls the toast list every
+2 s (new toasts are recognised by id; nothing that was already there is replayed). With the setting
+off the worker only sleeps.
 
 **GPU usage and network speed go through PDH** (`\GPU Engine(*)\Utilization Percentage`,
-`\Network Interface(*)\Bytes Received/sec` and `...Bytes Sent/sec`), summed across every matching
-counter instance. If a counter fails to open on a given machine (unsupported GPU driver, no active
+`\Network Interface(*)\Bytes Received/sec` and `...Bytes Sent/sec`). GPU load is the busiest engine
+(per-process instances summed per engine, like Task Manager); network speed is the busiest adapter, so
+virtual adapters (Hyper-V / WSL / VPN) do not double-count. If a counter fails to open on a given machine (unsupported GPU driver, no active
 network adapter, etc.) that one gauge just shows "n/a" / stays at the last good value - it does not
 bring anything else down.
 
@@ -135,3 +141,12 @@ or press `Escape` to release it.
 **Game bar mode** (`fullscreen_mode = gamebar`) makes the window click-through and ignore the mouse
 entirely while a full-screen app is active, by design - that is what lets clicks and gameplay pass
 straight through to the game underneath it.
+
+**Game-bar FPS / lows / frame time** come from a private real-time ETW session on the DXGI and D3D9
+`Present` events (the source PresentMon uses), measured for the foreground process - no injection,
+works with any Direct3D game, and the session only exists while the game bar shows a frame readout.
+Starting an ETW session needs administrator rights or membership of the *Performance Log Users* group;
+without that the bar shows `FPS admin` (add yourself with `net localgroup "Performance Log Users"
+%USERNAME% /add`, then sign out and in). Vulkan / OpenGL titles that do not present through DXGI show
+`FPS –`. Lows are the 99th / 99.9th percentile frame time of the last 10 s, as FPS. Ping is an ICMP
+echo once a second; hosts that drop ICMP show `–`.

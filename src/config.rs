@@ -18,6 +18,49 @@ pub enum FullscreenMode {
     GameBar,
 }
 
+/// Game-bar readouts, stored as a bit set in `Config::game_items`.
+pub mod gb {
+    pub const FPS: u16 = 1 << 0;
+    pub const LOW1: u16 = 1 << 1;
+    pub const LOW01: u16 = 1 << 2;
+    pub const FRAMETIME: u16 = 1 << 3;
+    pub const CPU: u16 = 1 << 4;
+    pub const GPU: u16 = 1 << 5;
+    pub const RAM: u16 = 1 << 6;
+    pub const PING: u16 = 1 << 7;
+    pub const NET: u16 = 1 << 8;
+    /// Readouts that need the present-event (ETW) frame tracker.
+    pub const FRAMES: u16 = FPS | LOW1 | LOW01 | FRAMETIME;
+    pub const DEFAULT: u16 = FPS | LOW1 | CPU | GPU | RAM;
+    /// Config-file names, in display order.
+    pub const NAMES: [(&str, u16); 9] = [
+        ("fps", FPS),
+        ("low1", LOW1),
+        ("low01", LOW01),
+        ("frametime", FRAMETIME),
+        ("cpu", CPU),
+        ("gpu", GPU),
+        ("ram", RAM),
+        ("ping", PING),
+        ("net", NET),
+    ];
+
+    pub fn parse(v: &str) -> u16 {
+        v.split([',', ' ', ';'])
+            .filter_map(|t| NAMES.iter().find(|(n, _)| n.eq_ignore_ascii_case(t.trim())).map(|(_, b)| *b))
+            .fold(0, |a, b| a | b)
+    }
+
+    pub fn render(bits: u16) -> String {
+        let v: Vec<&str> = NAMES.iter().filter(|(_, b)| bits & b != 0).map(|(n, _)| *n).collect();
+        if v.is_empty() {
+            "none".into()
+        } else {
+            v.join(",")
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub expand_on: ExpandOn,
@@ -48,6 +91,12 @@ pub struct Config {
     pub notifications: bool,
     /// What happens to the island while a full-screen app/game/presentation owns the screen.
     pub fullscreen_mode: FullscreenMode,
+    /// Live upload / download speed on the System tab (Performance setting).
+    pub net_speed: bool,
+    /// Which readouts the game bar shows (`gb::*` bits).
+    pub game_items: u16,
+    /// Host pinged once a second while the game bar shows ping.
+    pub ping_host: String,
 }
 
 impl Default for Config {
@@ -73,6 +122,9 @@ impl Default for Config {
             timer_sound: true,
             notifications: false,
             fullscreen_mode: FullscreenMode::Hide,
+            net_speed: true,
+            game_items: gb::DEFAULT,
+            ping_host: "1.1.1.1".into(),
         }
     }
 }
@@ -97,7 +149,9 @@ pub fn parse(text: &str) -> Config {
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') || line.starts_with('[') {
             continue;
         }
-        let Some((k, v)) = line.split_once('=') else { continue };
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
         let (k, v) = (k.trim().to_ascii_lowercase(), v.trim());
         match k.as_str() {
             "expand_on" => {
@@ -135,6 +189,11 @@ pub fn parse(text: &str) -> Config {
                 } else {
                     FullscreenMode::Hide
                 }
+            }
+            "net_speed" => c.net_speed = truthy(v),
+            "gamebar_items" => c.game_items = gb::parse(v),
+            "ping_host" if !v.is_empty() && v.len() <= 253 && !v.contains(char::is_whitespace) => {
+                c.ping_host = v.to_string()
             }
             _ => {}
         }
@@ -223,9 +282,19 @@ hide_fullscreen = {hide}
 
 # What happens instead of hiding, if hide_fullscreen is on and this is \"gamebar\":
 # hide    = the island disappears completely (default)
-# gamebar = it shrinks to a tiny click-through bar with live CPU / GPU / RAM, never reacts to
+# gamebar = it shrinks to a tiny click-through bar with live FPS / CPU / GPU / RAM (gamebar_items), never reacts to
 #           the mouse and never expands - so it never gets in the way of a game.
 fullscreen_mode = {fsmode}
+
+# Game-bar readouts, comma separated, in any combination:
+# fps, low1 (1% low), low01 (0.1% low), frametime, cpu, gpu, ram, ping, net  - or \"none\"
+gamebar_items = {gbitems}
+
+# Host for the game bar's ping readout (IPv4 address or name, e.g. your game server).
+ping_host = {pinghost}
+
+# Live upload / download speed on the System tab (1/0). Off = network counters are never opened.
+net_speed = {netspeed}
 
 # Peek on new Windows toast notifications (1/0). Needs notification-listener permission, which
 # an unpackaged .exe like this one is commonly denied - see the README. Off by default.
@@ -257,6 +326,9 @@ accent = {accent}
         notif = b(c.notifications),
         fps = c.fps_cap,
         accent = accent,
+        gbitems = gb::render(c.game_items),
+        pinghost = c.ping_host,
+        netspeed = b(c.net_speed),
     )
 }
 
@@ -318,8 +390,19 @@ mod tests {
             timer_sound: false,
             notifications: true,
             fullscreen_mode: FullscreenMode::GameBar,
+            net_speed: false,
+            game_items: gb::FPS | gb::LOW01 | gb::PING | gb::NET,
+            ping_host: "eu.game.example".into(),
         };
         assert_eq!(parse(&render(&c)), c);
+    }
+
+    #[test]
+    fn game_items_parse() {
+        assert_eq!(gb::parse("fps, LOW1 ,ping,bogus"), gb::FPS | gb::LOW1 | gb::PING);
+        assert_eq!(gb::parse("none"), 0);
+        assert_eq!(parse(&render(&Config { game_items: 0, ..Config::default() })).game_items, 0);
+        assert_eq!(parse("ping_host = a b").ping_host, "1.1.1.1");
     }
 
     #[test]

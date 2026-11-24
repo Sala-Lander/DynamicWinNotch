@@ -3,11 +3,12 @@
 //! All coordinates are logical pixels; positions of controls come from `layout::Geo`, the same
 //! source the hit-testing uses, so drawing and clicking can never disagree.
 
-use crate::config::Config;
+use crate::config::{gb, Config};
+use crate::fps::{FrameStats, State as FpsState};
 use crate::gfx::{self, pixmap_from_rgba, rgba, Canvas, Weight};
 use crate::history::{History, Kind};
 use crate::layout::{
-    game_bar_rect, settings_ctl_right, Geo, Hit, Rect, Style, Tab, CLIP_LIST_OFFSET, CLIP_VISIBLE_ROWS, ROW_H, TAB_COUNT,
+    game_bar_rect_w, settings_ctl_right, Geo, Hit, Rect, Style, Tab, CLIP_LIST_OFFSET, CLIP_VISIBLE_ROWS, ROW_H, TAB_COUNT,
     TIMER_PRESETS, VISIBLE_ROWS,
 };
 use crate::media::MediaView;
@@ -120,6 +121,10 @@ pub struct Scene<'a> {
     pub search_active: bool,
     /// Draw the tiny always-click-through game bar instead of the normal pill.
     pub game_bar: bool,
+    /// Game-bar frame numbers (`None` = the game is not presenting) and tracker state.
+    pub frames: Option<FrameStats>,
+    pub fps_state: FpsState,
+    pub ping_ms: Option<u32>,
 }
 
 fn white(a: f32) -> Color {
@@ -331,25 +336,152 @@ fn draw_bell(cv: &mut Canvas, cx: f32, cy: f32, scale: f32, a: f32) {
 /// The whole overlay in "game bar" mode: a tiny, always-click-through strip with no hover or
 /// expand state at all, just three mini readouts. Never animated (there is nothing to spring
 /// towards - it is either on screen like this, or not on screen).
+/// One game-bar readout: optional load ring, dim label, bright value.
+struct GbCell {
+    ring: Option<f32>,
+    label: &'static str,
+    value: String,
+    color: (u8, u8, u8),
+}
+
+const GB_LABEL: f32 = 8.5;
+const GB_VALUE: f32 = 10.5;
+const GB_GAP: f32 = 10.0;
+
+/// Green / amber / red for a frame rate, like the load colours.
+fn fps_color(fps: f32) -> (u8, u8, u8) {
+    if fps < 30.0 {
+        (255, 69, 58)
+    } else if fps < 55.0 {
+        (255, 159, 10)
+    } else {
+        (48, 209, 88)
+    }
+}
+
+fn ping_color(ms: u32) -> (u8, u8, u8) {
+    if ms >= 120 {
+        (255, 69, 58)
+    } else if ms >= 60 {
+        (255, 159, 10)
+    } else {
+        (48, 209, 88)
+    }
+}
+
+/// Short rate for the bar: "830K", "12.4M".
+fn fmt_rate_short(bps: f64) -> String {
+    let k = bps.max(0.0) / 1024.0;
+    if k < 1000.0 {
+        format!("{k:.0}K")
+    } else {
+        format!("{:.1}M", k / 1024.0)
+    }
+}
+
+fn game_bar_cells(sc: &Scene) -> Vec<GbCell> {
+    let items = sc.cfg.game_items;
+    let st = sc.stats;
+    let dim = (200, 200, 205);
+    let mut v = Vec::new();
+    let on = |b: u16| items & b != 0;
+    if items & gb::FRAMES != 0 {
+        match (sc.fps_state, sc.frames) {
+            (FpsState::Denied, _) => v.push(GbCell { ring: None, label: "FPS", value: "admin".into(), color: dim }),
+            (FpsState::Failed, _) => v.push(GbCell { ring: None, label: "FPS", value: "n/a".into(), color: dim }),
+            (_, Some(f)) => {
+                if on(gb::FPS) {
+                    v.push(GbCell {
+                        ring: None,
+                        label: "FPS",
+                        value: format!("{:.0}", f.fps),
+                        color: fps_color(f.fps),
+                    });
+                }
+                if on(gb::LOW1) {
+                    v.push(GbCell {
+                        ring: None,
+                        label: "1%",
+                        value: format!("{:.0}", f.low1),
+                        color: fps_color(f.low1),
+                    });
+                }
+                if on(gb::LOW01) {
+                    v.push(GbCell {
+                        ring: None,
+                        label: "0.1%",
+                        value: format!("{:.0}", f.low01),
+                        color: fps_color(f.low01),
+                    });
+                }
+                if on(gb::FRAMETIME) {
+                    v.push(GbCell { ring: None, label: "ms", value: format!("{:.1}", f.frametime_ms), color: WHITE });
+                }
+            }
+            (_, None) => v.push(GbCell { ring: None, label: "FPS", value: "\u{2013}".into(), color: dim }),
+        }
+    }
+    let gpu = st.gpu_pct.unwrap_or(0.0);
+    for (bit, label, pct, base) in [
+        (gb::CPU, "C", st.cpu, (90, 200, 250)),
+        (gb::GPU, "G", gpu, (255, 159, 10)),
+        (gb::RAM, "R", st.ram_pct, (191, 90, 242)),
+    ] {
+        if on(bit) {
+            let value =
+                if bit == gb::GPU && st.gpu_pct.is_none() { "n/a".into() } else { format!("{}", pct.round() as i32) };
+            v.push(GbCell { ring: Some(pct / 100.0), label, value, color: load_color(base, pct) });
+        }
+    }
+    if on(gb::PING) {
+        match sc.ping_ms {
+            Some(ms) => v.push(GbCell { ring: None, label: "ms", value: ms.to_string(), color: ping_color(ms) }),
+            None => v.push(GbCell { ring: None, label: "ms", value: "\u{2013}".into(), color: dim }),
+        }
+    }
+    if on(gb::NET) {
+        let value = if st.net_ok {
+            format!("\u{2193}{} \u{2191}{}", fmt_rate_short(st.net_down_bps), fmt_rate_short(st.net_up_bps))
+        } else {
+            "\u{2193}\u{2191} off".into()
+        };
+        v.push(GbCell { ring: None, label: "", value, color: WHITE });
+    }
+    v
+}
+
 fn draw_game_bar(cv: &mut Canvas, sc: &Scene) {
-    let r = game_bar_rect();
+    let cells = game_bar_cells(sc);
+    // Measure: [ring 15 px] label value, cells separated by GB_GAP.
+    let widths: Vec<(f32, f32)> = cells
+        .iter()
+        .map(|c| {
+            let lw = if c.label.is_empty() { 0.0 } else { cv.text_width(c.label, GB_LABEL, Weight::Semibold) + 2.5 };
+            let ring = if c.ring.is_some() { 15.0 } else { 0.0 };
+            (ring + lw, cv.text_width(&c.value, GB_VALUE, Weight::Semibold))
+        })
+        .collect();
+    let content: f32 = widths.iter().map(|w| w.0 + w.1).sum::<f32>() + GB_GAP * cells.len().saturating_sub(1) as f32;
+    let r = game_bar_rect_w(content + 24.0);
     if let Some(path) = gfx::rrect(r, r.h * 0.5) {
         cv.fill(&path, rgba((0, 0, 0), 0.82));
         cv.stroke(&path, 1.0, white(0.10), false);
         cv.set_clip(path);
     }
-    let st = sc.stats;
-    let cols: [(&str, f32, (u8, u8, u8)); 3] = [
-        ("C", st.cpu / 100.0, load_color((90, 200, 250), st.cpu)),
-        ("G", st.gpu_pct.unwrap_or(0.0) / 100.0, load_color((255, 159, 10), st.gpu_pct.unwrap_or(0.0))),
-        ("R", st.ram_pct / 100.0, load_color((191, 90, 242), st.ram_pct)),
-    ];
-    let col_w = r.w / 3.0;
-    for (i, (label, frac, color)) in cols.iter().enumerate() {
-        let cx = r.x + col_w * (i as f32 + 0.5);
-        draw_ring(cv, cx - 10.0, r.cy(), 6.5, 2.2, *frac, *color, 1.0);
-        let pct = (frac * 100.0).round() as i32;
-        cv.text(&format!("{label}{pct}"), cx - 1.0, r.cy() + 4.0, 10.5, Weight::Semibold, WHITE, 0.9);
+    let base = r.cy() + 4.0;
+    let mut x = r.cx() - content * 0.5;
+    for (c, (pre, vw)) in cells.iter().zip(widths) {
+        let mut lx = x;
+        if let Some(frac) = c.ring {
+            draw_ring(cv, x + 6.5, r.cy(), 6.5, 2.2, frac, c.color, 1.0);
+            lx += 15.0;
+        }
+        if !c.label.is_empty() {
+            cv.text(c.label, lx, base - 0.5, GB_LABEL, Weight::Semibold, WHITE, 0.5);
+        }
+        let vc = if c.ring.is_some() { WHITE } else { c.color };
+        cv.text(&c.value, x + pre, base, GB_VALUE, Weight::Semibold, vc, 0.9);
+        x += pre + vw + GB_GAP;
     }
     cv.unclip_rect();
 }
@@ -459,7 +591,8 @@ fn page_media(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) -> bool {
 
     // Title (scrolls when it does not fit) and subtitle.
     let tx = g.text_x + ox;
-    let title = if m.title.is_empty() { "Unknown title" } else { m.title.as_str() };
+    // Missing metadata reads "Empty" - never the previous track's title.
+    let title = if m.title.is_empty() { "Empty" } else { m.title.as_str() };
     let tw = cv.text_width(title, 16.0, Weight::Semibold);
     let mut marquee = false;
     if tw <= g.text_w {
@@ -475,7 +608,7 @@ fn page_media(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) -> bool {
         (false, false) => format!("{} \u{b7} {}", m.artist, m.album),
         (false, true) => m.artist.clone(),
         (true, false) => m.album.clone(),
-        (true, true) => m.app.clone(),
+        (true, true) => String::new(),
     };
     let sub = cv.fit(&sub, 12.5, Weight::Regular, g.text_w);
     cv.text(&sub, tx, g.artist_y, 12.5, Weight::Regular, WHITE, 0.62 * a);
@@ -780,7 +913,13 @@ fn page_system(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
 
     // Network speed, centred under the rings.
     let cx = g.content.cx() + ox;
-    let line = format!("\u{2193} {}   \u{2191} {}", fmt_rate(st.net_down_bps), fmt_rate(st.net_up_bps));
+    let line = if !sc.cfg.net_speed {
+        "Network speed off \u{b7} Settings".to_string()
+    } else if !st.net_ok {
+        "\u{2193} \u{2013}   \u{2191} \u{2013}".to_string()
+    } else {
+        format!("\u{2193} {}   \u{2191} {}", fmt_rate(st.net_down_bps), fmt_rate(st.net_up_bps))
+    };
     cv.text_centered(&line, cx, g.net_y, 11.0, Weight::Regular, WHITE, 0.55 * a);
 }
 
@@ -945,6 +1084,27 @@ fn page_settings(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
                     }
                     let al = if is_sel { 1.0 } else if hov_sub(k) { 0.85 } else { 0.5 };
                     cv.text_centered(labels[k], r.cx(), r.y + 14.5, 11.5, Weight::Semibold, WHITE, al * a);
+                }
+            }
+            Ctl::Chips(labels) => {
+                let whole = Rect::new(rects[0].x, rects[0].y, rects[n - 1].right() - rects[0].x, rects[0].h);
+                cv.fill_rrect(whole, 10.0, white(0.08 * a));
+                for k in 0..n {
+                    let r = rects[k];
+                    let on = settings::chip_on(row.id, sc.cfg, k);
+                    if on {
+                        cv.fill_rrect(r.inflate(-2.0), 8.0, rgba(sc.accent, 0.85 * a));
+                    } else if hov_sub(k) {
+                        cv.fill_rrect(r.inflate(-2.0), 8.0, white(0.10 * a));
+                    }
+                    let al = if on {
+                        1.0
+                    } else if hov_sub(k) {
+                        0.85
+                    } else {
+                        0.5
+                    };
+                    cv.text_centered(labels[k], r.cx(), r.y + 14.5, 11.0, Weight::Semibold, WHITE, al * a);
                 }
             }
             Ctl::Swatch => {
