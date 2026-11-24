@@ -19,6 +19,8 @@ use windows::UI::Notifications::{KnownNotificationBindings, NotificationKinds, U
 #[derive(Clone, Debug, Default)]
 pub struct Notif {
     pub app: String,
+    /// App User Model ID of the sender (opens the app when the peek is clicked).
+    pub aumid: String,
     pub title: String,
     pub body: String,
 }
@@ -56,13 +58,14 @@ pub fn title_body<I: IntoIterator<Item = String>>(texts: I) -> (String, String) 
 }
 
 fn to_notif(n: &UserNotification) -> Option<Notif> {
-    let app = n
-        .AppInfo()
-        .ok()
+    let info = n.AppInfo().ok();
+    let app = info
+        .as_ref()
         .and_then(|i| i.DisplayInfo().ok())
         .and_then(|d| d.DisplayName().ok())
         .map(|s| s.to_string())
         .unwrap_or_default();
+    let aumid = info.as_ref().and_then(|i| i.AppUserModelId().ok()).map(|s| s.to_string()).unwrap_or_default();
     // A listener result is a `Notification`, read through its visual's ToastGeneric binding
     // (it is not a `ToastNotification`).
     let binding =
@@ -72,7 +75,7 @@ fn to_notif(n: &UserNotification) -> Option<Notif> {
     if title.is_empty() && body.is_empty() {
         return None;
     }
-    Some(Notif { app, title, body })
+    Some(Notif { app, aumid, title, body })
 }
 
 /// Ids of the current toasts, plus the newest one that is not in `seen`.

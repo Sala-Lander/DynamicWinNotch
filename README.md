@@ -10,7 +10,7 @@ small control surface with five tabs.
 | **Clipboard** | History of everything you copy: **text, links** (host highlighted), **colours** (`#RRGGBB`, `rgb(...)` get a swatch), **files** (Explorer copies) and **images** (thumbnail in the row; screenshots, "Copy image" in a browser, ...). A **search box** at the top filters the list live (case-insensitive, matches the preview text). Click a row to copy it back (images go back as images), right-click to pin, middle-click to delete, wheel to scroll, "Clear" to wipe unpinned items. |
 | **System** | CPU, GPU, memory and battery as live ring gauges, plus thread count, used/total RAM, charge state and live **network throughput** (down / up, auto-scaled B·s⁻¹ / KB·s⁻¹ / MB·s⁻¹; switchable with *Live network speed*). |
 | **Timer** | Three modes, cycled with the header's mode label (where "Clear" sits on the Clipboard tab): **Countdown** (presets, start / pause / reset, +-1 min, wheel to adjust; peeks and sounds at zero), **Stopwatch** (start / pause / reset, counts up), **Reminders** (quick-add +10 / +30 / +60 min, up to 5 pending at once, "Clear all"; each one peeks and sounds when it comes due). |
-| **Settings** | Every option in the island itself: expand mode, style, accent colour swatches, toggles (album art, equalizer, peeks, battery alerts, timer sound, clipboard images, notification peeks, password-manager filter, full-screen hiding, start with Windows), a full-screen behaviour switch (hide / game bar), game-bar readout chips (FPS, 1 %, 0.1 %, frame time / CPU, GPU, RAM, ping, network), live network speed, steppers (history size, hover delay), frame rate. Changes apply immediately and are saved to `config.ini`. |
+| **Settings** | Every option in the island itself: expand mode, style, accent colour swatches, toggles (album art, equalizer, peeks, battery alerts, timer sound, clipboard images, notification peeks, volume / brightness / Caps-Num Lock / Bluetooth peeks, mic & camera indicator, password-manager filter, full-screen hiding, start with Windows), do not disturb (off / on / games), a full-screen behaviour switch (hide / game bar), game-bar readout chips (FPS, 1 %, 0.1 %, frame time / CPU, GPU, RAM, ping, network), live network speed, steppers (history size, hover delay), frame rate. Changes apply immediately and are saved to `config.ini`. |
 
 Native Win32 layered window + `tiny-skia` software rendering. No webview, no GPU framework,
 no Electron/Tauri runtime, no polling loop.
@@ -36,7 +36,14 @@ detection, settings model, timer, battery-alert logic, config round-trip and hel
 * The pill briefly widens (peek) on a track change (cover + title), on every new clipboard item
   (thumbnail for images, swatch for colours), when the timer/stopwatch-adjacent reminders fire, for
   battery events (charger plugged in / removed, battery low (20 %) and critical (10 %), fully
-  charged), and - best-effort, see **Limitations** - on a new Windows toast notification.
+  charged), on a new Windows toast notification (click the peek to open the app), when the volume
+  or (laptop) screen brightness changes (with a level bar), when Caps Lock / Num Lock is switched,
+  when a Bluetooth device connects or disconnects, and when an app starts using the microphone or
+  camera.
+* While an app uses the camera / microphone a green / orange dot stays on the collapsed island.
+* **Do not disturb** (`on`, or `games` = only while a full-screen app runs) mutes the track,
+  clipboard, notification, Bluetooth and mic / camera peeks; volume, brightness, lock-key, timer and
+  battery peeks stay because they answer something you just did.
 * While a full-screen app, game or presentation is running, the island either hides itself or, if
   `fullscreen_mode` is set to **game bar**, shrinks into a tiny click-through bar at the top of the
   screen, which ignores the mouse entirely and never expands. Its readouts are picked with the
@@ -52,7 +59,8 @@ created on first run and rewritten (with comments) whenever you change a setting
 `island` = floating pill), `start_tab`, `hover_delay_ms`, `collapse_delay_ms`, `history_size`,
 `clip_images`, `image_budget_mb` (compressed-image memory budget, 8-512), `album_art`, `equalizer`,
 `auto_peek`, `power_alerts`, `timer_sound`, `privacy_filter`, `hotkey`, `hide_fullscreen`, `fps_cap`,
-`notifications` (toast-notification peeks, best-effort - see **Limitations**), `fullscreen_mode`
+`notifications` (toast-notification peeks - see **Limitations**), `volume_peek`, `brightness_peek`,
+`lock_peek`, `bt_peek`, `privacy_dot` (all 1/0), `dnd` (`off` / `on` / `games`), `fullscreen_mode`
 (`hide` or `gamebar`, what `hide_fullscreen` switches to when triggered), `gamebar_items`
 (comma list of `fps,low1,low01,frametime,cpu,gpu,ram,ping,net`, or `none`), `ping_host` (default
 `1.1.1.1`), `net_speed` (live network throughput, 1/0), `accent` (`auto` = from the
@@ -102,6 +110,7 @@ src/win.rs      layered window, DIB present, raw input, tray, autostart
 src/ffi.rs      hand-written Win32 declarations (the `windows` crate is used only for WinRT)
 src/media.rs    GSMTC worker thread + cover-art decoding
 src/notify.rs   toast-notification worker thread (WinRT UserNotificationListener, best-effort)
+src/devices.rs  volume (COM callback), mic / camera (registry notifications), Bluetooth (DeviceWatcher)
 src/clip.rs     clipboard worker: files, text, images (arboard + Win32), compression, thumbnails
 src/sys.rs      CPU / GPU / RAM / network / battery sampling (GPU and network via PDH)
 src/history.rs  clipboard history: kinds, pinning, image budget (pure, unit-tested)
@@ -123,6 +132,16 @@ re-checks every 15 s, so no restart is needed after allowing it. Unpackaged apps
 subscribe to the live notification event, so while peeks are on the island polls the toast list every
 2 s (new toasts are recognised by id; nothing that was already there is replayed). With the setting
 off the worker only sleeps.
+
+**Device peeks are event-driven, no polling.** Volume: `IAudioEndpointVolumeCallback` on the default
+output (the default device is re-checked every 10 s). Brightness: `GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS`
+power-setting notifications - laptop panels; most external monitors never report brightness to
+Windows, so no peek there. Caps / Num Lock: raw keyboard input, registered only while that peek is
+on, and only those two keys are looked at. Mic / camera: Windows' own usage log under
+`HKCU\...\CapabilityAccessManager\ConsentStore` (the same data as the privacy icon in the taskbar),
+watched with `RegNotifyChangeKeyValue`. Bluetooth: WinRT `DeviceWatcher` on connected classic and LE
+devices (a device shown in both lists peeks once). Clicking a notification peek opens the sender
+through `shell:AppsFolder\<AUMID>`; apps that are not in the Start menu cannot be opened that way.
 
 **GPU usage and network speed go through PDH** (`\GPU Engine(*)\Utilization Percentage`,
 `\Network Interface(*)\Bytes Received/sec` and `...Bytes Sent/sec`). GPU load is the busiest engine

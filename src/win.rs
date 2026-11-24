@@ -13,6 +13,10 @@ pub const WM_APP_MEDIA: u32 = WM_APP + 1;
 pub const WM_APP_CLIP: u32 = WM_APP + 2;
 pub const WM_APP_TRAY: u32 = WM_APP + 3;
 pub const WM_APP_NOTIFY: u32 = WM_APP + 4;
+/// wParam = volume 0..=100, lParam = muted.
+pub const WM_APP_VOLUME: u32 = WM_APP + 5;
+pub const WM_APP_PRIVACY: u32 = WM_APP + 6;
+pub const WM_APP_BT: u32 = WM_APP + 7;
 pub const TIMER_ID: usize = 1;
 const HOTKEY_ID: i32 = 1;
 
@@ -54,12 +58,61 @@ pub enum Ev {
     LostFocus,
     /// A fresh toast notification, if notification-listener access was granted.
     Notify,
+    /// Laptop panel brightness changed (0..=100).
+    Brightness(u32),
+    /// Master volume changed: (0..=100, muted).
+    Volume(u32, bool),
+    /// Caps Lock (VK_CAPITAL) or Num Lock (VK_NUMLOCK) was pressed.
+    Lock(u16),
+    /// Microphone / camera use changed (see `devices::spawn_privacy`).
+    Privacy,
+    /// A Bluetooth device connected or disconnected (see `devices::spawn_bluetooth`).
+    Bluetooth,
 }
 
 thread_local! {
     static QUEUE: RefCell<VecDeque<Ev>> = const { RefCell::new(VecDeque::new()) };
 }
 static TASKBAR_MSG: AtomicU32 = AtomicU32::new(0);
+/// Lock keys currently held (bit 0 = Caps, bit 1 = Num), so auto-repeat does not peek again.
+static LOCK_HELD: AtomicU32 = AtomicU32::new(0);
+
+/// `Some(vk)` on the first key-down of Caps / Num Lock; key-ups and repeats give `None`.
+pub fn lock_edge(held: &mut u32, vk: u16, msg: u32) -> Option<u16> {
+    let bit = match vk {
+        VK_CAPITAL => 1,
+        VK_NUMLOCK => 2,
+        _ => return None,
+    };
+    if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
+        let first = *held & bit == 0;
+        *held |= bit;
+        first.then_some(vk)
+    } else {
+        *held &= !bit;
+        None
+    }
+}
+
+/// Raw input: keyboard packets only matter for the lock keys; anything else is pointer movement.
+unsafe fn on_raw_input(lp: isize) {
+    let mut buf = [0u64; 8];
+    let mut size = std::mem::size_of_val(&buf) as u32;
+    let hs = std::mem::size_of::<RAWINPUTHEADER>() as u32;
+    let n = GetRawInputData(lp, RID_INPUT, buf.as_mut_ptr() as *mut c_void, &mut size, hs);
+    let hdr = &*(buf.as_ptr() as *const RAWINPUTHEADER);
+    if n != u32::MAX && n >= hs + 16 && hdr.dwType == RIM_TYPEKEYBOARD {
+        let kb = &*((buf.as_ptr() as *const u8).add(hs as usize) as *const RAWKEYBOARD);
+        let mut held = LOCK_HELD.load(Ordering::Relaxed);
+        let edge = lock_edge(&mut held, kb.VKey, kb.Message);
+        LOCK_HELD.store(held, Ordering::Relaxed);
+        if let Some(vk) = edge {
+            push(Ev::Lock(vk));
+        }
+    } else {
+        push(Ev::Mouse);
+    }
+}
 
 pub fn push(ev: Ev) {
     QUEUE.with(|q| {
@@ -84,7 +137,7 @@ unsafe extern "system" fn wndproc(hwnd: HANDLE, msg: u32, wp: usize, lp: isize) 
         // click-through; this is how hover is detected with zero polling. DefWindowProc must
         // still run so the system can free the raw-input buffer.
         WM_INPUT => {
-            push(Ev::Mouse);
+            on_raw_input(lp);
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_MOUSEMOVE => {
@@ -130,6 +183,12 @@ unsafe extern "system" fn wndproc(hwnd: HANDLE, msg: u32, wp: usize, lp: isize) 
         WM_POWERBROADCAST => {
             if wp == PBT_APMPOWERSTATUSCHANGE {
                 push(Ev::Power);
+            } else if wp == PBT_POWERSETTINGCHANGE && lp != 0 {
+                let s = &*(lp as *const POWERBROADCAST_SETTING);
+                if s.PowerSetting == GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS && s.DataLength >= 4 {
+                    let pct = std::ptr::read_unaligned(s.Data.as_ptr() as *const u32);
+                    push(Ev::Brightness(pct.min(100)));
+                }
             }
             1 // TRUE: the broadcast is handled
         }
@@ -153,6 +212,18 @@ unsafe extern "system" fn wndproc(hwnd: HANDLE, msg: u32, wp: usize, lp: isize) 
         }
         WM_APP_NOTIFY => {
             push(Ev::Notify);
+            0
+        }
+        WM_APP_VOLUME => {
+            push(Ev::Volume(wp.min(100) as u32, lp != 0));
+            0
+        }
+        WM_APP_PRIVACY => {
+            push(Ev::Privacy);
+            0
+        }
+        WM_APP_BT => {
+            push(Ev::Bluetooth);
             0
         }
         WM_DISPLAYCHANGE | WM_DPICHANGED => {
@@ -209,6 +280,17 @@ pub fn fullscreen_app_active() -> bool {
     let mut st = 0i32;
     let hr = unsafe { SHQueryUserNotificationState(&mut st) };
     hr >= 0 && matches!(st, QUNS_BUSY | QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE)
+}
+
+/// Start / focus an app by its App User Model ID (what a toast notification carries).
+pub fn open_app(aumid: &str) {
+    if aumid.is_empty() || aumid.contains('"') {
+        return;
+    }
+    let args = wide(&format!("shell:AppsFolder\\{aumid}"));
+    unsafe {
+        ShellExecuteW(0, wide("open").as_ptr(), wide("explorer.exe").as_ptr(), args.as_ptr(), null(), SW_SHOWNORMAL);
+    }
 }
 
 pub fn open_in_editor(path: &std::path::Path) {
@@ -370,6 +452,8 @@ impl Win {
             // Pointer movement while click-through: raw mouse input delivered even in the background.
             let rid = RAWINPUTDEVICE { usUsagePage: 1, usUsage: 2, dwFlags: RIDEV_INPUTSINK, hwndTarget: hwnd };
             RegisterRawInputDevices(&rid, 1, std::mem::size_of::<RAWINPUTDEVICE>() as u32);
+            // Panel brightness changes arrive as WM_POWERBROADCAST (no-op on desktop monitors).
+            RegisterPowerSettingNotification(hwnd, &GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS, DEVICE_NOTIFY_WINDOW_HANDLE);
 
             let mut w = Win { hwnd, surf: None, scale: 1.0, origin: (0, 0), size_px: (0, 0), through: true, visible: true };
             w.reposition();
@@ -463,6 +547,17 @@ impl Win {
 
     pub fn disarm_timer(&self) {
         unsafe { KillTimer(self.hwnd, TIMER_ID) };
+    }
+
+    /// Raw keyboard input (background too) for the Caps / Num Lock peek; only while it is on.
+    pub fn watch_lock_keys(&self, on: bool) {
+        let rid = RAWINPUTDEVICE {
+            usUsagePage: 1,
+            usUsage: 6,
+            dwFlags: if on { RIDEV_INPUTSINK } else { RIDEV_REMOVE },
+            hwndTarget: if on { self.hwnd } else { 0 },
+        };
+        unsafe { RegisterRawInputDevices(&rid, 1, std::mem::size_of::<RAWINPUTDEVICE>() as u32) };
     }
 
     pub fn register_hotkey(&self, on: bool) {
@@ -603,5 +698,21 @@ pub fn popup_menu(hwnd: HANDLE, items: &[(usize, &str, bool)]) -> usize {
         PostMessageW(hwnd, WM_NULL, 0, 0);
         DestroyMenu(menu);
         cmd.max(0) as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_keys_peek_once_per_press() {
+        let mut held = 0;
+        assert_eq!(lock_edge(&mut held, VK_CAPITAL, WM_KEYDOWN), Some(VK_CAPITAL));
+        assert_eq!(lock_edge(&mut held, VK_CAPITAL, WM_KEYDOWN), None); // auto-repeat
+        assert_eq!(lock_edge(&mut held, VK_NUMLOCK, WM_KEYDOWN), Some(VK_NUMLOCK));
+        assert_eq!(lock_edge(&mut held, VK_CAPITAL, WM_KEYUP), None);
+        assert_eq!(lock_edge(&mut held, VK_CAPITAL, WM_KEYDOWN), Some(VK_CAPITAL));
+        assert_eq!(lock_edge(&mut held, 0x41, WM_KEYDOWN), None); // 'A' is never looked at
     }
 }

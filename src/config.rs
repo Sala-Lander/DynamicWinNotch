@@ -61,6 +61,16 @@ pub mod gb {
     }
 }
 
+/// Do-not-disturb: mutes the informational peeks (track, clipboard, notification, Bluetooth,
+/// mic / camera). Volume, lock-key, timer and battery peeks are direct feedback and stay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dnd {
+    Off,
+    On,
+    /// Only while a full-screen app or game is running.
+    Games,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub expand_on: ExpandOn,
@@ -97,6 +107,17 @@ pub struct Config {
     pub game_items: u16,
     /// Host pinged once a second while the game bar shows ping.
     pub ping_host: String,
+    /// Peek with a level bar when the master volume changes.
+    pub volume_peek: bool,
+    /// Peek with a level bar when the (laptop) screen brightness changes.
+    pub brightness_peek: bool,
+    /// Peek when Caps Lock / Num Lock is switched.
+    pub lock_peek: bool,
+    /// Peek when a Bluetooth device connects or disconnects.
+    pub bt_peek: bool,
+    /// Coloured dot while an app uses the microphone (orange) or camera (green).
+    pub privacy_dot: bool,
+    pub dnd: Dnd,
 }
 
 impl Default for Config {
@@ -125,6 +146,12 @@ impl Default for Config {
             net_speed: true,
             game_items: gb::DEFAULT,
             ping_host: "1.1.1.1".into(),
+            volume_peek: true,
+            brightness_peek: true,
+            lock_peek: true,
+            bt_peek: true,
+            privacy_dot: true,
+            dnd: Dnd::Off,
         }
     }
 }
@@ -191,6 +218,18 @@ pub fn parse(text: &str) -> Config {
                 }
             }
             "net_speed" => c.net_speed = truthy(v),
+            "volume_peek" => c.volume_peek = truthy(v),
+            "brightness_peek" => c.brightness_peek = truthy(v),
+            "lock_peek" => c.lock_peek = truthy(v),
+            "bt_peek" => c.bt_peek = truthy(v),
+            "privacy_dot" => c.privacy_dot = truthy(v),
+            "dnd" => {
+                c.dnd = match v.to_ascii_lowercase().as_str() {
+                    "on" | "1" | "true" | "yes" => Dnd::On,
+                    "games" | "game" | "fullscreen" => Dnd::Games,
+                    _ => Dnd::Off,
+                }
+            }
             "gamebar_items" => c.game_items = gb::parse(v),
             "ping_host" if !v.is_empty() && v.len() <= 253 && !v.contains(char::is_whitespace) => {
                 c.ping_host = v.to_string()
@@ -300,6 +339,26 @@ net_speed = {netspeed}
 # an unpackaged .exe like this one is commonly denied - see the README. Off by default.
 notifications = {notif}
 
+# Peek with a level bar when the volume changes (1/0).
+volume_peek = {volpeek}
+
+# Peek with a level bar when the screen brightness changes (1/0). Laptop panels; external
+# monitors usually do not report brightness to Windows.
+brightness_peek = {brightpeek}
+
+# Peek when Caps Lock / Num Lock is switched (1/0).
+lock_peek = {lockpeek}
+
+# Peek when a Bluetooth device (earbuds, controller, ...) connects or disconnects (1/0).
+bt_peek = {btpeek}
+
+# Dot on the collapsed island while an app uses the microphone (orange) or camera (green) (1/0).
+privacy_dot = {privdot}
+
+# Do not disturb: off | on | games (only while a full-screen app runs). Mutes track, clipboard,
+# notification, Bluetooth and mic / camera peeks; volume, lock keys, timer and battery stay.
+dnd = {dnd}
+
 # Animation frame cap (15-240). The loop is vsync-paced, so this only limits very high refresh rates.
 fps_cap = {fps}
 
@@ -328,6 +387,16 @@ accent = {accent}
         accent = accent,
         gbitems = gb::render(c.game_items),
         pinghost = c.ping_host,
+        volpeek = b(c.volume_peek),
+        brightpeek = b(c.brightness_peek),
+        lockpeek = b(c.lock_peek),
+        btpeek = b(c.bt_peek),
+        privdot = b(c.privacy_dot),
+        dnd = match c.dnd {
+            Dnd::Off => "off",
+            Dnd::On => "on",
+            Dnd::Games => "games",
+        },
         netspeed = b(c.net_speed),
     )
 }
@@ -393,6 +462,12 @@ mod tests {
             net_speed: false,
             game_items: gb::FPS | gb::LOW01 | gb::PING | gb::NET,
             ping_host: "eu.game.example".into(),
+            volume_peek: false,
+            brightness_peek: false,
+            lock_peek: false,
+            bt_peek: false,
+            privacy_dot: false,
+            dnd: Dnd::Games,
         };
         assert_eq!(parse(&render(&c)), c);
     }
