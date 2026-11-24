@@ -406,6 +406,8 @@ extern "system" {
 
 // PDH: used for the GPU and network-speed gauges (wildcard counters summed across instances).
 pub const PDH_FMT_DOUBLE: u32 = 0x0000_0200;
+pub const PDH_CSTATUS_VALID_DATA: u32 = 0;
+pub const PDH_CSTATUS_NEW_DATA: u32 = 1;
 pub const PDH_MORE_DATA: i32 = 0x8000_07D2u32 as i32;
 
 #[repr(C)]

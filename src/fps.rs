@@ -97,26 +97,14 @@ pub fn foreground_pid() -> u32 {
     pid
 }
 
-/// Pick the frames to measure: the foreground process if it presented recently, otherwise the
-/// busiest presenter (games that render from a helper process). DXGI wins over D3D9 per process
-/// so a D3D9-on-DXGI title is not counted twice.
-pub fn select(frames: &[Frame], fg_pid: u32, now: i64) -> Vec<i64> {
-    let recent = |p: u32| frames.iter().rev().take_while(|f| now - f.1 <= 2 * SEC).filter(|f| f.0 == p).count();
-    let mut pid = fg_pid;
-    if fg_pid == 0 || recent(fg_pid) == 0 {
-        let mut best = (0usize, 0u32);
-        for f in frames.iter().rev().take_while(|f| now - f.1 <= 2 * SEC) {
-            if f.0 != best.1 {
-                let n = recent(f.0);
-                if n > best.0 {
-                    best = (n, f.0);
-                }
-            }
-        }
-        pid = best.1;
+/// Frames of the foreground process (the full-screen game). DXGI wins over D3D9 per process so a
+/// D3D9-on-DXGI title is not counted twice. Nothing captured for it -> no reading ("FPS -").
+pub fn select(frames: &[Frame], fg_pid: u32) -> Vec<i64> {
+    if fg_pid == 0 {
+        return Vec::new();
     }
-    let has_dxgi = frames.iter().any(|f| f.0 == pid && f.2);
-    frames.iter().filter(|f| f.0 == pid && f.2 == has_dxgi).map(|f| f.1).collect()
+    let has_dxgi = frames.iter().any(|f| f.0 == fg_pid && f.2);
+    frames.iter().filter(|f| f.0 == fg_pid && f.2 == has_dxgi).map(|f| f.1).collect()
 }
 
 /// FPS, lows and frame time from ascending present timestamps (100 ns). `None` when the game
@@ -126,8 +114,7 @@ pub fn compute(times: &[i64], now: i64) -> Option<FrameStats> {
     if times.len() < 3 || now - last > 2 * SEC {
         return None;
     }
-    let mut deltas: Vec<f64> =
-        times.windows(2).map(|w| (w[1] - w[0]) as f64 / 10_000.0).filter(|d| *d > 0.0 && *d < 2000.0).collect();
+    let mut deltas: Vec<f64> = times.windows(2).map(|w| (w[1] - w[0]) as f64 / 10_000.0).filter(|d| *d > 0.0).collect();
     let recent: Vec<f64> = times
         .windows(2)
         .filter(|w| last - w[1] < SEC)
@@ -262,7 +249,7 @@ impl Tracker {
             return None;
         }
         let frames: Vec<Frame> = FRAMES.lock().ok()?.iter().copied().collect();
-        compute(&select(&frames, foreground_pid(), now_ticks()), now_ticks())
+        compute(&select(&frames, foreground_pid()), now_ticks())
     }
 }
 
@@ -315,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn selects_foreground_then_busiest_and_prefers_dxgi() {
+    fn selects_foreground_only_and_prefers_dxgi() {
         let mut f: Vec<Frame> = Vec::new();
         for i in 0..100i64 {
             f.push((7, i * 100_000, true)); // game, DXGI
@@ -324,9 +311,20 @@ mod tests {
                 f.push((9, i * 100_000 + 2, true)); // browser
             }
         }
-        let now = 100 * 100_000;
-        assert_eq!(select(&f, 7, now).len(), 100);
-        assert_eq!(select(&f, 9, now).len(), 25);
-        assert_eq!(select(&f, 1234, now).len(), 100); // unknown foreground -> busiest
+        assert_eq!(select(&f, 7).len(), 100);
+        assert_eq!(select(&f, 9).len(), 25);
+        assert!(select(&f, 1234).is_empty()); // never another app's frames
+        assert!(select(&f, 0).is_empty());
+    }
+
+    #[test]
+    fn freeze_shows_in_lows_after_resume() {
+        let mut t = steady(600, 16, 0); // ~60 fps
+        for v in t.iter_mut().skip(300) {
+            *v += 3 * SEC; // 3 s shader-compile hitch, then the game resumes
+        }
+        let s = compute(&t, *t.last().unwrap()).unwrap();
+        assert!(s.fps > 55.0, "{s:?}");
+        assert!(s.low01 < 1.0, "{s:?}");
     }
 }

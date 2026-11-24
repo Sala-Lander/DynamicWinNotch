@@ -74,13 +74,18 @@ impl PdhSum {
             let mut out = Vec::with_capacity(count as usize);
             for i in 0..count as usize {
                 let item = &*items.add(i);
-                if item.fmt_value.c_status == 0 {
+                if pdh_value_ok(item.fmt_value.c_status) {
                     out.push((from_wide_ptr(item.sz_name), item.fmt_value.value.double_value));
                 }
             }
             Some(out)
         }
     }
+}
+
+/// Both "valid" and "new" (rate counters whose raw data changed) are successful readings.
+pub fn pdh_value_ok(status: u32) -> bool {
+    status == crate::ffi::PDH_CSTATUS_VALID_DATA || status == crate::ffi::PDH_CSTATUS_NEW_DATA
 }
 
 /// GPU load the way Task Manager reports it: per-process instances are summed per engine
@@ -142,7 +147,8 @@ pub fn decode_power(ac_line: u8, flag: u8, percent: u8, life_time: u32) -> (Opti
 pub fn power_now() -> Power {
     let mut ps = SYSTEM_POWER_STATUS::default();
     if unsafe { GetSystemPowerStatus(&mut ps) } != 0 {
-        let (pct, charging, on_ac, _) = decode_power(ps.ACLineStatus, ps.BatteryFlag, ps.BatteryLifePercent, ps.BatteryLifeTime);
+        let (pct, charging, on_ac, _) =
+            decode_power(ps.ACLineStatus, ps.BatteryFlag, ps.BatteryLifePercent, ps.BatteryLifeTime);
         Power { pct, on_ac, charging }
     } else {
         Power { pct: None, on_ac: true, charging: false }
@@ -235,6 +241,14 @@ impl Sampler {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pdh_new_data_counts() {
+        assert!(pdh_value_ok(0));
+        assert!(pdh_value_ok(1));
+        assert!(!pdh_value_ok(0xC000_0BBA)); // PDH_CSTATUS_NO_INSTANCE
+    }
+
     use super::*;
 
     #[test]

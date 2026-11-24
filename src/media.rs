@@ -138,6 +138,7 @@ struct Worker {
     /// the new title before the new thumbnail still hands out the old cover for a moment.
     prev_art: Option<(u64, String)>,
     cur_art: Option<(u64, String)>,
+    last_art_try: Option<Instant>,
     playing: bool,
 }
 
@@ -188,6 +189,7 @@ fn run(hwnd: HANDLE, tx: Sender<Msg>, rx: Receiver<Msg>, shared: Arc<Mutex<Share
         art_tries: 0,
         prev_art: None,
         cur_art: None,
+        last_art_try: None,
         playing: false,
     };
     w.refresh();
@@ -237,6 +239,7 @@ impl Worker {
             // Fetch the cover of the current track on the next refresh.
             self.have_art = false;
             self.art_tries = 0;
+            self.last_art_try = None;
         }
     }
 
@@ -376,6 +379,7 @@ impl Worker {
             self.track_id += 1;
             self.have_art = false;
             self.art_tries = 0;
+            self.last_art_try = None;
             if self.cur_art.is_some() {
                 self.prev_art = self.cur_art.take();
             }
@@ -384,9 +388,13 @@ impl Worker {
             }
         }
         // Players often publish the thumbnail a moment after the text: retry for a few seconds.
-        if let Some(p) = props.as_ref().filter(|_| self.want_art && !self.have_art && self.art_tries < ART_TRIES) {
+        // Every attempt (also a failed metadata read) spends a try, paced by ART_RETRY so bursts of
+        // media events cannot use up the budget before the new thumbnail arrives.
+        let due = self.last_art_try.map_or(true, |t| t.elapsed() >= ART_RETRY);
+        if self.want_art && !self.have_art && self.art_tries < ART_TRIES && due {
             self.art_tries += 1;
-            if let Some(a) = load_art(p) {
+            self.last_art_try = Some(Instant::now());
+            if let Some(a) = props.as_ref().and_then(load_art) {
                 let h = art_hash(&a);
                 if !stale_cover(self.prev_art.as_ref(), h, &info.album, self.art_tries >= ART_TRIES) {
                     self.cur_art = Some((h, info.album.clone()));
@@ -432,11 +440,8 @@ fn load_art(props: &MediaProps) -> Option<Art> {
         return None;
     }
     let short = w.min(h) as u64;
-    let (tw, th) = if short > 256 {
-        ((w as u64 * 256 / short) as u32, (h as u64 * 256 / short) as u32)
-    } else {
-        (w, h)
-    };
+    let (tw, th) =
+        if short > 256 { ((w as u64 * 256 / short) as u32, (h as u64 * 256 / short) as u32) } else { (w, h) };
     let tf = BitmapTransform::new().ok()?;
     tf.SetScaledWidth(tw).ok()?;
     tf.SetScaledHeight(th).ok()?;
