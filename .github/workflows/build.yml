@@ -2,21 +2,39 @@ name: build
 
 on:
   push:
+    branches: [ main ]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
       - name: Unit tests
         run: cargo test --release
+
       - name: Build
         run: cargo build --release
-      - uses: actions/upload-artifact@v4
+
+      - name: Lees versie uit Cargo.toml
+        id: versie
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+          echo "tag=v$v" >> $env:GITHUB_OUTPUT
+
+      - name: Maak automatische Release
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
         with:
-          name: notch-island
-          path: target/release/notch-island.exe
+          tag_name: ${{ steps.versie.outputs.tag }}
+          name: Release ${{ steps.versie.outputs.tag }}
+          files: target/release/notch-island.exe
+          generate_release_notes: true
