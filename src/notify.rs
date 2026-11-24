@@ -12,11 +12,9 @@ use crate::win::WM_APP_NOTIFY;
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use windows::core::Interface;
-use windows::Data::Xml::Dom::XmlDocument;
-use windows::Foundation::TypedEventHandler;
+use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
 use windows::UI::Notifications::Management::{UserNotificationListener, UserNotificationListenerAccessStatus};
-use windows::UI::Notifications::{NotificationKinds, ToastNotification, UserNotification};
+use windows::UI::Notifications::{KnownNotificationBindings, NotificationKinds, UserNotification};
 
 #[derive(Clone, Debug, Default)]
 pub struct Notif {
@@ -51,34 +49,26 @@ pub struct Shared {
     pub access: Access,
 }
 
-/// First two non-empty text lines of a toast's generic visual binding: title, then body.
-fn extract_text(toast_xml: &XmlDocument) -> (String, String) {
-    let mut lines = Vec::new();
-    if let Ok(nodes) = toast_xml.GetElementsByTagName(&windows::core::HSTRING::from("text")) {
-        for i in 0..nodes.Length().unwrap_or(0) {
-            if let Ok(node) = nodes.Item(i) {
-                if let Ok(text) = node.InnerText() {
-                    let t = text.to_string();
-                    if !t.trim().is_empty() {
-                        lines.push(t);
-                    }
-                }
-            }
-            if lines.len() >= 2 {
-                break;
-            }
-        }
-    }
-    let title = lines.first().cloned().unwrap_or_default();
-    let body = lines.get(1).cloned().unwrap_or_default();
-    (title, body)
+/// First two non-empty lines of `texts`: title, then body.
+pub fn title_body<I: IntoIterator<Item = String>>(texts: I) -> (String, String) {
+    let mut it = texts.into_iter().filter(|t| !t.trim().is_empty());
+    (it.next().unwrap_or_default(), it.next().unwrap_or_default())
 }
 
 fn to_notif(n: &UserNotification) -> Option<Notif> {
-    let app = n.AppInfo().ok().and_then(|i| i.DisplayInfo().ok()).and_then(|d| d.DisplayName().ok()).map(|s| s.to_string()).unwrap_or_default();
-    let notification: ToastNotification = n.Notification().ok()?.cast().ok()?;
-    let xml = notification.Content().ok()?;
-    let (title, body) = extract_text(&xml);
+    let app = n
+        .AppInfo()
+        .ok()
+        .and_then(|i| i.DisplayInfo().ok())
+        .and_then(|d| d.DisplayName().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    // A listener result is a `Notification`, read through its visual's ToastGeneric binding
+    // (it is not a `ToastNotification`).
+    let binding =
+        n.Notification().ok()?.Visual().ok()?.GetBinding(&KnownNotificationBindings::ToastGeneric().ok()?).ok()?;
+    let texts = binding.GetTextElements().ok()?;
+    let (title, body) = title_body((&texts).into_iter().filter_map(|t| t.Text().ok()).map(|h| h.to_string()));
     if title.is_empty() && body.is_empty() {
         return None;
     }
@@ -160,12 +150,24 @@ pub fn spawn(hwnd: HANDLE, enabled: bool) -> (Sender<Msg>, Arc<Mutex<Shared>>) {
         let mut seen: Vec<u32> = Vec::new();
         let mut baseline = false;
         // `Some` once the push subscription works; then polling is not needed.
-        let mut pushed: Option<(Arc<Mutex<Vec<u32>>>, i64)> = None;
+        let mut pushed: Option<(Arc<Mutex<Vec<u32>>>, EventRegistrationToken)> = None;
+        let unsubscribe = |pushed: &mut Option<(Arc<Mutex<Vec<u32>>>, EventRegistrationToken)>| {
+            if let Some((_, token)) = pushed.take() {
+                let _ = listener.RemoveNotificationChanged(token);
+            }
+        };
         loop {
             if enabled {
-                if access != Access::Allowed {
-                    access = access_now(&listener, !asked);
-                    asked = true;
+                // Re-checked every round: a revoked permission makes the toast list silently empty.
+                let now = access_now(&listener, !asked);
+                asked = true;
+                if now != access {
+                    if access == Access::Allowed {
+                        unsubscribe(&mut pushed);
+                        baseline = false; // do not replay old toasts once access returns
+                        seen.clear();
+                    }
+                    access = now;
                     set_access(access);
                 }
                 if access == Access::Allowed && pushed.is_none() && !baseline {
@@ -183,7 +185,7 @@ pub fn spawn(hwnd: HANDLE, enabled: bool) -> (Sender<Msg>, Arc<Mutex<Shared>>) {
                         Ok(())
                     });
                     if let Ok(token) = listener.NotificationChanged(&handler) {
-                        pushed = Some((ids, token.Value));
+                        pushed = Some((ids, token));
                     }
                 }
                 if access == Access::Allowed && pushed.is_none() {
@@ -198,8 +200,7 @@ pub fn spawn(hwnd: HANDLE, enabled: bool) -> (Sender<Msg>, Arc<Mutex<Shared>>) {
             }
             let wait = match (enabled, access) {
                 (false, _) => Duration::from_secs(3600),
-                (true, Access::Allowed) if pushed.is_some() => Duration::from_secs(3600),
-                (true, Access::Allowed) => Duration::from_secs(2),
+                (true, Access::Allowed) if pushed.is_none() => Duration::from_secs(2),
                 (true, Access::Unsupported) => Duration::from_secs(3600),
                 (true, _) => Duration::from_secs(15),
             };
@@ -211,19 +212,15 @@ pub fn spawn(hwnd: HANDLE, enabled: bool) -> (Sender<Msg>, Arc<Mutex<Shared>>) {
                         baseline = false;
                         seen.clear();
                         access = Access::Unknown;
-                        if let Some((ids, _)) = &pushed {
-                            let mut v = ids.lock().unwrap_or_else(|e| e.into_inner());
-                            *v = poll(&listener, &[]).map(|p| p.0).unwrap_or_default();
-                        }
+                    } else if !on {
+                        unsubscribe(&mut pushed);
                     }
                     enabled = on;
                 }
                 Err(RecvTimeoutError::Timeout) => {}
             }
         }
-        if let Some((_, token)) = pushed {
-            let _ = listener.RemoveNotificationChanged(windows::Foundation::EventRegistrationToken { Value: token });
-        }
+        unsubscribe(&mut pushed);
     });
     (tx, shared)
 }
@@ -231,6 +228,14 @@ pub fn spawn(hwnd: HANDLE, enabled: bool) -> (Sender<Msg>, Arc<Mutex<Shared>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_and_body_skip_blank_lines() {
+        let t = |v: &[&str]| title_body(v.iter().map(|s| s.to_string()));
+        assert_eq!(t(&["Reminder", " ", "Standup at 10:00", "extra"]), ("Reminder".into(), "Standup at 10:00".into()));
+        assert_eq!(t(&["", "Only"]), ("Only".into(), String::new()));
+        assert_eq!(t(&[]), (String::new(), String::new()));
+    }
 
     #[test]
     fn first_poll_is_only_a_baseline() {
