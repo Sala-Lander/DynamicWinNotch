@@ -248,9 +248,8 @@ impl Tracker {
             CloseTrace(self.trace);
         }
         self.trace = INVALID_PROCESSTRACE_HANDLE;
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        // ProcessTrace returns once the session is gone; never block the UI thread waiting for it.
+        self.thread = None;
         if let Ok(mut q) = FRAMES.lock() {
             q.clear();
         }
