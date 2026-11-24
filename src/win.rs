@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub const WM_APP_MEDIA: u32 = WM_APP + 1;
 pub const WM_APP_CLIP: u32 = WM_APP + 2;
 pub const WM_APP_TRAY: u32 = WM_APP + 3;
+pub const WM_APP_NOTIFY: u32 = WM_APP + 4;
 pub const TIMER_ID: usize = 1;
 const HOTKEY_ID: i32 = 1;
 
@@ -45,6 +46,14 @@ pub enum Ev {
     TaskbarCreated,
     /// Charger plugged / unplugged or the battery level changed.
     Power,
+    /// A character typed while the clipboard search box has focus.
+    Char(char),
+    /// A control key relevant to text entry: VK_BACK, VK_ESCAPE or VK_RETURN.
+    Key(usize),
+    /// The window lost keyboard focus (e.g. the user alt-tabbed away): stop "typing".
+    LostFocus,
+    /// A fresh toast notification, if notification-listener access was granted.
+    Notify,
 }
 
 thread_local! {
@@ -123,6 +132,28 @@ unsafe extern "system" fn wndproc(hwnd: HANDLE, msg: u32, wp: usize, lp: isize) 
                 push(Ev::Power);
             }
             1 // TRUE: the broadcast is handled
+        }
+        WM_CHAR => {
+            if let Some(c) = char::from_u32(wp as u32) {
+                if !c.is_control() {
+                    push(Ev::Char(c));
+                }
+            }
+            0
+        }
+        WM_KEYDOWN => {
+            if matches!(wp, VK_BACK | VK_ESCAPE | VK_RETURN) {
+                push(Ev::Key(wp));
+            }
+            0
+        }
+        WM_KILLFOCUS => {
+            push(Ev::LostFocus);
+            0
+        }
+        WM_APP_NOTIFY => {
+            push(Ev::Notify);
+            0
         }
         WM_DISPLAYCHANGE | WM_DPICHANGED => {
             push(Ev::DisplayChange);
@@ -445,6 +476,18 @@ impl Win {
 
     pub fn listen_clipboard(&self) {
         unsafe { AddClipboardFormatListener(self.hwnd) };
+    }
+
+    /// Briefly take keyboard focus so the clipboard search box can receive typed characters.
+    /// The window is otherwise `WS_EX_NOACTIVATE` (it never steals focus on its own), so this is
+    /// a deliberate exception: clicking the search box visibly takes over the keyboard the way a
+    /// Spotlight / PowerToys-Run style search field does, until Escape, Enter or a click
+    /// elsewhere, or until the user switches away (which sends `WM_KILLFOCUS` -> `Ev::LostFocus`).
+    pub fn focus_for_typing(&self) {
+        unsafe {
+            SetForegroundWindow(self.hwnd);
+            SetFocus(self.hwnd);
+        }
     }
 
     pub fn destroy(&mut self) {

@@ -74,6 +74,7 @@ pub enum Cmd {
 pub enum Msg {
     Refresh,
     Cmd(Cmd),
+    /// Turn album-art loading on or off at run time (Settings tab).
     SetArt(bool),
     Quit,
 }
@@ -172,29 +173,17 @@ fn run(hwnd: HANDLE, tx: Sender<Msg>, rx: Receiver<Msg>, shared: Arc<Mutex<Share
                 w.command(c);
                 std::thread::sleep(Duration::from_millis(120)); // let the player apply it
             }
+            Ok(Msg::SetArt(v)) => w.set_art(v),
             Ok(Msg::Refresh) => std::thread::sleep(Duration::from_millis(40)), // coalesce event bursts
-            Ok(Msg::SetArt(v)) => {
-                w.want_art = v;
-                if !v {
-                    let mut g = w.shared.lock().unwrap_or_else(|e| e.into_inner());
-                    g.art_update = Some(None);
-                }
-            }
             Err(RecvTimeoutError::Timeout) => {}
         }
         let mut quit = false;
         while let Ok(m) = rx.try_recv() {
             match m {
                 Msg::Cmd(c) => w.command(c),
+                Msg::SetArt(v) => w.set_art(v),
                 Msg::Quit => quit = true,
                 Msg::Refresh => {}
-                Msg::SetArt(v) => {
-                    w.want_art = v;
-                    if !v {
-                        let mut g = w.shared.lock().unwrap_or_else(|e| e.into_inner());
-                        g.art_update = Some(None);
-                    }
-                }
             }
         }
         if quit {
@@ -205,6 +194,15 @@ fn run(hwnd: HANDLE, tx: Sender<Msg>, rx: Receiver<Msg>, shared: Arc<Mutex<Share
 }
 
 impl Worker {
+    fn set_art(&mut self, on: bool) {
+        self.want_art = on;
+        if on {
+            // Fetch the cover of the current track on the next refresh.
+            self.have_art = false;
+            self.art_tries = 0;
+        }
+    }
+
     fn command(&mut self, c: Cmd) {
         let Ok(s) = self.manager.GetCurrentSession() else { return };
         match c {

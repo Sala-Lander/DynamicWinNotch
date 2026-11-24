@@ -202,6 +202,19 @@ pub fn fmt_bytes(n: usize) -> String {
     }
 }
 
+/// "412 B/s", "1.3 MB/s" - a transfer rate in bytes/second.
+pub fn fmt_rate(bytes_per_sec: f64) -> String {
+    const KB: f64 = 1024.0;
+    let f = bytes_per_sec.max(0.0);
+    if f < KB {
+        format!("{f:.0} B/s")
+    } else if f < KB * KB {
+        format!("{:.0} KB/s", f / KB)
+    } else {
+        format!("{:.1} MB/s", f / (KB * KB))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +238,12 @@ mod tests {
         assert_eq!(fmt_bytes(812), "812 B");
         assert_eq!(fmt_bytes(34 * 1024), "34 KB");
         assert_eq!(fmt_bytes(1_258_291), "1.2 MB");
+
+        assert_eq!(fmt_rate(0.0), "0 B/s");
+        assert_eq!(fmt_rate(412.0), "412 B/s");
+        assert_eq!(fmt_rate(34.0 * 1024.0), "34 KB/s");
+        assert_eq!(fmt_rate(1_363_148.8), "1.3 MB/s");
+        assert_eq!(fmt_rate(-5.0), "0 B/s"); // never negative
     }
 
     #[test]

@@ -104,6 +104,19 @@ pub const EXPANDED: (f32, f32) = (452.0, 172.0);
 
 pub const ROW_H: f32 = 28.0;
 pub const VISIBLE_ROWS: usize = 4;
+/// Clipboard rows visible at once: one fewer than `VISIBLE_ROWS` to leave room for the search box.
+pub const CLIP_VISIBLE_ROWS: usize = 3;
+/// Height of the clipboard search box plus the gap before the first row.
+pub const CLIP_LIST_OFFSET: f32 = 28.0;
+
+/// Size of the tiny always-click-through bar shown instead of the pill in "game bar" mode.
+pub const GAME_BAR: (f32, f32) = (150.0, 22.0);
+
+/// The game bar, centred at the top edge (it never uses `Style`: it is flush with the edge
+/// either way, since nothing should draw attention by floating).
+pub fn game_bar_rect() -> Rect {
+    Rect::new((WIN_W - GAME_BAR.0) * 0.5, 0.0, GAME_BAR.0, GAME_BAR.1)
+}
 
 pub fn margin_top(style: Style) -> f32 {
     match style {
@@ -125,6 +138,8 @@ pub struct Geo {
     pub pin: Rect,
     pub clear: Rect,
     pub content: Rect,
+    /// Clipboard search box; the row list starts below it.
+    pub search: Rect,
     // media page
     pub art: Rect,
     pub text_x: f32,
@@ -140,6 +155,8 @@ pub struct Geo {
     pub ring_y: f32,
     pub ring_r: f32,
     pub col_w: f32,
+    /// Baseline of the network-speed text row under the four system rings.
+    pub net_y: f32,
     // timer page
     pub t_ring: Rect,
     pub t_presets: [Rect; 5],
@@ -167,6 +184,7 @@ pub fn geo(style: Style) -> Geo {
         *t = Rect::new(x0 + i as f32 * (tab_w + gap), ty, tab_w, 24.0);
     }
     let content = Rect::new(p.x + 18.0, p.y + 46.0, p.w - 36.0, p.h - 46.0 - 14.0);
+    let search = Rect::new(content.x, content.y, content.w, 24.0);
     let art = Rect::new(content.x, content.y + 10.0, 92.0, 92.0);
     let text_x = art.right() + 16.0;
     let text_w = content.right() - text_x;
@@ -186,6 +204,7 @@ pub fn geo(style: Style) -> Geo {
         pin: Rect::new(p.right() - 18.0 - 24.0, ty, 24.0, 24.0),
         clear: Rect::new(p.x + 18.0, ty, 56.0, 24.0),
         content,
+        search,
         art,
         text_x,
         text_w,
@@ -196,9 +215,10 @@ pub fn geo(style: Style) -> Geo {
         prev: Rect::new(cx - 56.0 - 14.0, cy - 14.0, 28.0, 28.0),
         play: Rect::new(cx - 17.0, cy - 17.0, 34.0, 34.0),
         next: Rect::new(cx + 56.0 - 14.0, cy - 14.0, 28.0, 28.0),
-        ring_y: content.y + 36.0,
-        ring_r: 26.0,
-        col_w: content.w / 3.0,
+        ring_y: content.y + 30.0,
+        ring_r: 21.0,
+        col_w: content.w / 4.0,
+        net_y: content.y + content.h - 9.0,
         t_ring: Rect::new(content.x + 8.0, content.y + 8.0, 96.0, 96.0),
         t_presets,
         t_minus: Rect::new(rx, by, 34.0, 32.0),
@@ -221,7 +241,8 @@ pub enum Hit {
     Next,
     /// Progress bar; payload is the fraction 0..=1.
     Seek(f32),
-    /// Clipboard row (absolute index into the history).
+    /// Clipboard row: a position in the *currently displayed* (filtered) list, not necessarily
+    /// an absolute index into the history - the caller maps it back using the same filter.
     Row(usize),
     /// Settings control: (row index, sub-control index, see `settings::sub_rects`).
     Set(usize, u8),
@@ -230,6 +251,8 @@ pub enum Hit {
     TimerToggle,
     TimerPlus,
     TimerReset,
+    /// Clipboard search box.
+    Search,
 }
 
 /// `scroll` is the clipboard scroll position in rows (fractional while animating).
@@ -240,7 +263,7 @@ pub fn hit_test(g: &Geo, tab: Tab, x: f32, y: f32, scroll: f32, rows: usize) -> 
     if g.pin.inflate(2.0).contains(x, y) {
         return Hit::Pin;
     }
-    if tab == Tab::Clipboard && g.clear.contains(x, y) {
+    if matches!(tab, Tab::Clipboard | Tab::Timer) && g.clear.contains(x, y) {
         return Hit::Clear;
     }
     for (i, t) in g.tabs.iter().enumerate() {
@@ -264,8 +287,12 @@ pub fn hit_test(g: &Geo, tab: Tab, x: f32, y: f32, scroll: f32, rows: usize) -> 
             }
         }
         Tab::Clipboard => {
-            if g.content.contains(x, y) {
-                let idx = (scroll + (y - g.content.y) / ROW_H).floor();
+            if g.search.inflate(2.0).contains(x, y) {
+                return Hit::Search;
+            }
+            let list_y = g.content.y + CLIP_LIST_OFFSET;
+            if y >= list_y && x >= g.content.x && x < g.content.right() {
+                let idx = (scroll + (y - list_y) / ROW_H).floor();
                 if idx >= 0.0 && (idx as usize) < rows {
                     return Hit::Row(idx as usize);
                 }
@@ -348,15 +375,26 @@ mod tests {
     #[test]
     fn clipboard_rows_follow_scroll() {
         let g = geo(Style::Notch);
-        let y0 = g.content.y + 3.0;
+        let y0 = g.content.y + CLIP_LIST_OFFSET + 3.0;
         assert_eq!(hit_test(&g, Tab::Clipboard, g.content.cx(), y0, 0.0, 10), Hit::Row(0));
         assert_eq!(hit_test(&g, Tab::Clipboard, g.content.cx(), y0 + ROW_H, 0.0, 10), Hit::Row(1));
         assert_eq!(hit_test(&g, Tab::Clipboard, g.content.cx(), y0, 2.0, 10), Hit::Row(2));
         // Past the last item.
         assert_eq!(hit_test(&g, Tab::Clipboard, g.content.cx(), y0 + ROW_H * 3.0, 0.0, 2), Hit::Body);
-        // Clear button only exists on the clipboard tab.
+        // The search box sits above the list.
+        assert_eq!(hit_test(&g, Tab::Clipboard, g.search.cx(), g.search.cy(), 0.0, 10), Hit::Search);
+        // Clear button doubles as the Timer mode toggle, but exists nowhere else.
         assert_eq!(hit_test(&g, Tab::Clipboard, g.clear.cx(), g.clear.cy(), 0.0, 3), Hit::Clear);
+        assert_eq!(hit_test(&g, Tab::Timer, g.clear.cx(), g.clear.cy(), 0.0, 3), Hit::Clear);
         assert_eq!(hit_test(&g, Tab::Media, g.clear.cx(), g.clear.cy(), 0.0, 3), Hit::Body);
+    }
+
+    #[test]
+    fn game_bar_is_centred_and_tiny() {
+        let r = game_bar_rect();
+        assert!((r.cx() - WIN_W * 0.5).abs() < 0.01);
+        assert_eq!(r.y, 0.0);
+        assert!(r.w < COLLAPSED.0 && r.h < COLLAPSED.1);
     }
 
     #[test]

@@ -204,6 +204,13 @@ pub const WM_POWERBROADCAST: u32 = 0x0218;
 pub const PBT_APMPOWERSTATUSCHANGE: usize = 0x000A;
 pub const CF_HDROP: u32 = 15;
 pub const MB_ICONASTERISK: u32 = 0x40;
+pub const WM_SETFOCUS: u32 = 0x0007;
+pub const WM_KILLFOCUS: u32 = 0x0008;
+pub const WM_KEYDOWN: u32 = 0x0100;
+pub const WM_CHAR: u32 = 0x0102;
+pub const VK_BACK: usize = 0x08;
+pub const VK_ESCAPE: usize = 0x1B;
+pub const VK_RETURN: usize = 0x0D;
 pub const WM_CLIPBOARDUPDATE: u32 = 0x031D;
 pub const WM_APP: u32 = 0x8000;
 
@@ -287,6 +294,7 @@ extern "system" {
     pub fn TrackPopupMenu(menu: HANDLE, flags: u32, x: i32, y: i32, reserved: i32, hwnd: HANDLE, rc: *const RECT) -> i32;
     pub fn DestroyMenu(menu: HANDLE) -> i32;
     pub fn SetForegroundWindow(hwnd: HANDLE) -> i32;
+    pub fn SetFocus(hwnd: HANDLE) -> HANDLE;
     pub fn RegisterHotKey(hwnd: HANDLE, id: i32, modifiers: u32, vk: u32) -> i32;
     pub fn UnregisterHotKey(hwnd: HANDLE, id: i32) -> i32;
     pub fn RegisterRawInputDevices(devs: *const RAWINPUTDEVICE, count: u32, size: u32) -> i32;
@@ -392,6 +400,48 @@ extern "system" {
 #[link(name = "ole32")]
 extern "system" {
     pub fn CoInitializeEx(reserved: *mut c_void, coinit: u32) -> i32;
+}
+
+// PDH: used for the GPU and network-speed gauges (wildcard counters summed across instances).
+pub const PDH_FMT_DOUBLE: u32 = 0x0000_0200;
+pub const PDH_MORE_DATA: i32 = 0x8000_7D2u32 as i32;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union PDH_VALUE {
+    pub long_value: i32,
+    pub double_value: f64,
+    pub large_value: i64,
+    pub str_value: *mut u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PDH_FMT_COUNTERVALUE {
+    pub c_status: u32,
+    pub value: PDH_VALUE,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PDH_FMT_COUNTERVALUE_ITEM_W {
+    pub sz_name: *mut u16,
+    pub fmt_value: PDH_FMT_COUNTERVALUE,
+}
+
+#[link(name = "pdh")]
+extern "system" {
+    pub fn PdhOpenQueryW(data_source: *const u16, user_data: usize, query: *mut isize) -> u32;
+    pub fn PdhAddEnglishCounterW(query: isize, counter_path: *const u16, user_data: usize, counter: *mut isize) -> u32;
+    pub fn PdhCollectQueryData(query: isize) -> u32;
+    pub fn PdhGetFormattedCounterArrayW(
+        counter: isize,
+        format: u32,
+        buffer_size: *mut u32,
+        item_count: *mut u32,
+        items: *mut PDH_FMT_COUNTERVALUE_ITEM_W,
+    ) -> u32;
+    pub fn PdhCloseQuery(query: isize) -> u32;
 }
 
 // ---------------------------------------------------------------- helpers

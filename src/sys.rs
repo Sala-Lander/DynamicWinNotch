@@ -3,6 +3,7 @@
 
 use crate::ffi::*;
 use crate::power::Power;
+use std::ptr::{null, null_mut};
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Stats {
@@ -16,10 +17,77 @@ pub struct Stats {
     pub on_ac: bool,
     pub secs_left: Option<u32>,
     pub threads: usize,
+    /// `None` when no "GPU Engine" performance counters are available.
+    pub gpu_pct: Option<f32>,
+    pub net_down_bps: f64,
+    pub net_up_bps: f64,
+}
+
+/// One wildcard PDH query (e.g. "\\GPU Engine(*)\\Utilization Percentage"): several matching
+/// instances summed into a single number. `None` once opening or adding the counter fails, so a
+/// system without these counters just reports nothing instead of crashing or spamming retries.
+struct PdhSum {
+    query: isize,
+    counter: isize,
+    buf: Vec<u8>,
+}
+
+impl PdhSum {
+    fn open(counter_path: &str) -> Option<Self> {
+        unsafe {
+            let mut query = 0isize;
+            if PdhOpenQueryW(null(), 0, &mut query) != 0 {
+                return None;
+            }
+            let mut counter = 0isize;
+            let path = wide(counter_path);
+            if PdhAddEnglishCounterW(query, path.as_ptr(), 0, &mut counter) != 0 {
+                PdhCloseQuery(query);
+                return None;
+            }
+            Some(Self { query, counter, buf: Vec::new() })
+        }
+    }
+
+    /// Sum of the formatted value across every instance the wildcard expanded to.
+    fn sample(&mut self) -> Option<f64> {
+        unsafe {
+            if PdhCollectQueryData(self.query) != 0 {
+                return None;
+            }
+            let (mut size, mut count) = (0u32, 0u32);
+            let r = PdhGetFormattedCounterArrayW(self.counter, PDH_FMT_DOUBLE, &mut size, &mut count, null_mut());
+            if r as i32 != PDH_MORE_DATA || size == 0 {
+                return None;
+            }
+            self.buf.resize(size as usize, 0);
+            let items = self.buf.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W;
+            if PdhGetFormattedCounterArrayW(self.counter, PDH_FMT_DOUBLE, &mut size, &mut count, items) != 0 {
+                return None;
+            }
+            let mut total = 0.0;
+            for i in 0..count as usize {
+                let item = &*items.add(i);
+                if item.fmt_value.c_status == 0 {
+                    total += item.fmt_value.value.double_value;
+                }
+            }
+            Some(total)
+        }
+    }
+}
+
+impl Drop for PdhSum {
+    fn drop(&mut self) {
+        unsafe { PdhCloseQuery(self.query) };
+    }
 }
 
 pub struct Sampler {
     prev: Option<(u64, u64)>, // (idle, total) from the last sample
+    gpu: Option<PdhSum>,
+    net_down: Option<PdhSum>,
+    net_up: Option<PdhSum>,
     pub stats: Stats,
 }
 
@@ -59,7 +127,13 @@ pub fn power_now() -> Power {
 impl Sampler {
     pub fn new() -> Self {
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-        let mut s = Self { prev: None, stats: Stats { threads, ..Stats::default() } };
+        let mut s = Self {
+            prev: None,
+            gpu: PdhSum::open("\\GPU Engine(*)\\Utilization Percentage"),
+            net_down: PdhSum::open("\\Network Interface(*)\\Bytes Received/sec"),
+            net_up: PdhSum::open("\\Network Interface(*)\\Bytes Sent/sec"),
+            stats: Stats { threads, ..Stats::default() },
+        };
         s.sample();
         s
     }
@@ -100,6 +174,24 @@ impl Sampler {
             self.stats.charging = charging;
             self.stats.on_ac = on_ac;
             self.stats.secs_left = secs;
+        }
+
+        // GPU utilization is a sum across every engine instance (3D, copy, video decode, ...);
+        // clamped because a busy multi-GPU machine can genuinely add up past 100%.
+        if let Some(gpu) = self.gpu.as_mut() {
+            if let Some(v) = gpu.sample() {
+                self.stats.gpu_pct = Some(v.clamp(0.0, 100.0) as f32);
+            }
+        }
+        if let Some(c) = self.net_down.as_mut() {
+            if let Some(v) = c.sample() {
+                self.stats.net_down_bps = v.max(0.0);
+            }
+        }
+        if let Some(c) = self.net_up.as_mut() {
+            if let Some(v) = c.sample() {
+                self.stats.net_up_bps = v.max(0.0);
+            }
         }
     }
 }

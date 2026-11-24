@@ -10,6 +10,14 @@ pub enum ExpandOn {
     Click,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FullscreenMode {
+    /// Hide the island entirely (previous, still-default behaviour).
+    Hide,
+    /// Shrink to a small always-click-through bar showing live CPU/GPU/RAM.
+    GameBar,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub expand_on: ExpandOn,
@@ -35,6 +43,11 @@ pub struct Config {
     pub power_alerts: bool,
     /// Play the system notification sound when the timer ends.
     pub timer_sound: bool,
+    /// Peek on new Windows toast notifications. Requires notification-listener access, which is
+    /// commonly denied to an unpackaged .exe - see the README.
+    pub notifications: bool,
+    /// What happens to the island while a full-screen app/game/presentation owns the screen.
+    pub fullscreen_mode: FullscreenMode,
 }
 
 impl Default for Config {
@@ -58,6 +71,8 @@ impl Default for Config {
             image_budget_mb: 64,
             power_alerts: true,
             timer_sound: true,
+            notifications: false,
+            fullscreen_mode: FullscreenMode::Hide,
         }
     }
 }
@@ -113,6 +128,14 @@ pub fn parse(text: &str) -> Config {
             "image_budget_mb" => c.image_budget_mb = v.parse::<u32>().unwrap_or(c.image_budget_mb).clamp(8, 512),
             "power_alerts" => c.power_alerts = truthy(v),
             "timer_sound" => c.timer_sound = truthy(v),
+            "notifications" => c.notifications = truthy(v),
+            "fullscreen_mode" => {
+                c.fullscreen_mode = if v.eq_ignore_ascii_case("gamebar") || v.eq_ignore_ascii_case("game_bar") {
+                    FullscreenMode::GameBar
+                } else {
+                    FullscreenMode::Hide
+                }
+            }
             _ => {}
         }
     }
@@ -198,6 +221,16 @@ hotkey = {hotkey}
 # Hide the island while a full-screen app, game or presentation is running (1/0).
 hide_fullscreen = {hide}
 
+# What happens instead of hiding, if hide_fullscreen is on and this is \"gamebar\":
+# hide    = the island disappears completely (default)
+# gamebar = it shrinks to a tiny click-through bar with live CPU / GPU / RAM, never reacts to
+#           the mouse and never expands - so it never gets in the way of a game.
+fullscreen_mode = {fsmode}
+
+# Peek on new Windows toast notifications (1/0). Needs notification-listener permission, which
+# an unpackaged .exe like this one is commonly denied - see the README. Off by default.
+notifications = {notif}
+
 # Animation frame cap (15-240). The loop is vsync-paced, so this only limits very high refresh rates.
 fps_cap = {fps}
 
@@ -220,6 +253,8 @@ accent = {accent}
         privacy = b(c.privacy_filter),
         hotkey = b(c.hotkey),
         hide = b(c.hide_fullscreen),
+        fsmode = if c.fullscreen_mode == FullscreenMode::GameBar { "gamebar" } else { "hide" },
+        notif = b(c.notifications),
         fps = c.fps_cap,
         accent = accent,
     )
@@ -281,6 +316,8 @@ mod tests {
             image_budget_mb: 200,
             power_alerts: false,
             timer_sound: false,
+            notifications: true,
+            fullscreen_mode: FullscreenMode::GameBar,
         };
         assert_eq!(parse(&render(&c)), c);
     }
@@ -292,6 +329,11 @@ mod tests {
         assert_eq!(c.image_budget_mb, 8);
         assert_eq!(c.start_tab, Tab::Timer);
         assert_eq!(parse("image_budget_mb = 99999").image_budget_mb, 512);
+        let c = parse("notifications = yes\nfullscreen_mode = gamebar");
+        assert!(c.notifications);
+        assert_eq!(c.fullscreen_mode, FullscreenMode::GameBar);
+        assert_eq!(parse("fullscreen_mode = hide").fullscreen_mode, FullscreenMode::Hide);
+        assert_eq!(parse("fullscreen_mode = bogus").fullscreen_mode, FullscreenMode::Hide);
     }
 
     #[test]

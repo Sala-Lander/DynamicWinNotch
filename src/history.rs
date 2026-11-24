@@ -241,6 +241,22 @@ impl History {
     pub fn clear_unpinned(&mut self) {
         self.items.retain(|e| e.pinned);
     }
+
+    /// Absolute indices of entries matching `query` (case-insensitive substring of the preview
+    /// text, or of the full text for anything that is not an image), in display order. An empty
+    /// query matches everything.
+    pub fn filter(&self, query: &str) -> Vec<usize> {
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return (0..self.items.len()).collect();
+        }
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.preview.to_lowercase().contains(&q) || e.text.to_lowercase().contains(&q))
+            .map(|(i, _)| i)
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -410,6 +426,20 @@ mod tests {
         assert_eq!(texts(&h), ["c", "b", "a"]);
         assert_eq!(h.bump(0), 0); // pinned stays
         assert_eq!(h.bump(99), 2);
+    }
+
+    #[test]
+    fn filter_matches_preview_and_text_case_insensitively() {
+        let mut h = History::new(10);
+        h.push("Hello World");
+        h.push("https://github.com/rust-lang/rust");
+        h.push("#FF8800");
+        // Newest push ends up at index 0: colour, then link, then the text.
+        assert_eq!(h.filter(""), [0, 1, 2]);
+        assert_eq!(h.filter("world"), [2]);
+        assert_eq!(h.filter("GITHUB"), [1]);
+        assert_eq!(h.filter("ff8800"), [0]);
+        assert!(h.filter("nope").is_empty());
     }
 
     #[test]

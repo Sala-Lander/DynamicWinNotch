@@ -14,6 +14,7 @@ mod gfx;
 mod history;
 mod layout;
 mod media;
+mod notify;
 mod power;
 mod settings;
 mod spring;

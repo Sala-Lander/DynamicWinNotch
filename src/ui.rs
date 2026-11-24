@@ -6,12 +6,15 @@
 use crate::config::Config;
 use crate::gfx::{self, pixmap_from_rgba, rgba, Canvas, Weight};
 use crate::history::{History, Kind};
-use crate::layout::{settings_ctl_right, Geo, Hit, Rect, Style, Tab, ROW_H, TAB_COUNT, TIMER_PRESETS, VISIBLE_ROWS};
+use crate::layout::{
+    game_bar_rect, settings_ctl_right, Geo, Hit, Rect, Style, Tab, CLIP_LIST_OFFSET, CLIP_VISIBLE_ROWS, ROW_H, TAB_COUNT,
+    TIMER_PRESETS, VISIBLE_ROWS,
+};
 use crate::media::MediaView;
 use crate::settings::{self, Ctl};
 use crate::sys::Stats;
 use crate::timer::fmt_clock;
-use crate::util::{fmt_time, lerp, marquee_offset, smoothstep};
+use crate::util::{fmt_rate, fmt_time, lerp, marquee_offset, smoothstep};
 use std::f32::consts::{FRAC_PI_2, TAU};
 use tiny_skia::{Color, Pixmap};
 
@@ -23,6 +26,8 @@ pub enum PeekKind {
     Clip,
     Timer,
     Power(PowerIcon),
+    /// A toast notification (app name is drawn as the line1/line2 already carry the text).
+    Notification,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -53,15 +58,27 @@ impl PeekInfo {
     }
 }
 
-/// What the timer looks like right now (computed by the app from `timer::Timer`).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TimerMode {
+    #[default]
+    Countdown,
+    Stopwatch,
+    Reminders,
+}
+
+/// What the Timer tab looks like right now (computed by the app from `timer::{Timer,Stopwatch}`
+/// and the reminder list).
+#[derive(Clone, Debug, Default)]
 pub struct TimerView {
+    pub mode: TimerMode,
     pub running: bool,
     pub finished: bool,
     pub secs: u64,
-    /// 1.0 = full, 0.0 = done.
+    /// 1.0 = full, 0.0 = done. Always 1.0 in Stopwatch mode (nothing to count down from).
     pub frac: f32,
     pub total_min: u32,
+    /// Remaining seconds of each pending reminder, soonest first.
+    pub reminders: Vec<u64>,
 }
 
 pub struct Scene<'a> {
@@ -97,6 +114,12 @@ pub struct Scene<'a> {
     pub stats: &'a Stats,
     pub accent: (u8, u8, u8),
     pub peek: Option<&'a PeekInfo>,
+    /// Current clipboard search text (empty = no filter).
+    pub search: &'a str,
+    /// The search box has keyboard focus (used only for the cursor-blink affordance).
+    pub search_active: bool,
+    /// Draw the tiny always-click-through game bar instead of the normal pill.
+    pub game_bar: bool,
 }
 
 fn white(a: f32) -> Color {
@@ -106,6 +129,10 @@ fn white(a: f32) -> Color {
 /// Paints one frame. Returns true when something needs continuous redraws (scrolling title).
 pub fn draw(cv: &mut Canvas, sc: &Scene) -> bool {
     cv.begin();
+    if sc.game_bar {
+        draw_game_bar(cv, sc);
+        return false;
+    }
     let p = sc.pill;
     let notch = sc.cfg.style == Style::Notch;
     let r_bot = (p.h * 0.5).min(30.0);
@@ -245,6 +272,10 @@ fn draw_peek(cv: &mut Canvas, sc: &Scene, pk: &PeekInfo, a: f32) {
             cv.fill_circle(cell.cx(), cy, 3.2, white(a));
         }
         PeekKind::Power(icon) => draw_power_icon(cv, cell.cx(), cy, icon, pk.level.unwrap_or(1.0), a),
+        PeekKind::Notification => {
+            cv.fill_rrect(cell, 8.0, white(0.10 * a));
+            draw_bell(cv, cell.cx(), cell.cy(), 0.55, 0.85 * a);
+        }
     }
     x += 40.0;
     let right_pad = if pk.kind == PeekKind::Track { 38.0 } else { 14.0 };
@@ -287,6 +318,42 @@ fn draw_power_icon(cv: &mut Canvas, cx: f32, cy: f32, icon: PowerIcon, level: f3
     }
 }
 
+/// A small notification bell: body + clapper, for the notification peek.
+fn draw_bell(cv: &mut Canvas, cx: f32, cy: f32, scale: f32, a: f32) {
+    let col = white(a);
+    if let Some(p) = gfx::arc_path(cx, cy - 1.5 * scale, 7.0 * scale, std::f32::consts::PI, std::f32::consts::PI) {
+        cv.stroke(&p, 1.8 * scale, col, false);
+    }
+    cv.fill_rrect(Rect::new(cx - 7.5 * scale, cy - 1.5 * scale, 15.0 * scale, 2.0 * scale), 1.0 * scale, col);
+    cv.fill_circle(cx, cy + 3.3 * scale, 1.8 * scale, col);
+}
+
+/// The whole overlay in "game bar" mode: a tiny, always-click-through strip with no hover or
+/// expand state at all, just three mini readouts. Never animated (there is nothing to spring
+/// towards - it is either on screen like this, or not on screen).
+fn draw_game_bar(cv: &mut Canvas, sc: &Scene) {
+    let r = game_bar_rect();
+    if let Some(path) = gfx::rrect(r, r.h * 0.5) {
+        cv.fill(&path, rgba((0, 0, 0), 0.82));
+        cv.stroke(&path, 1.0, white(0.10), false);
+        cv.set_clip(path);
+    }
+    let st = sc.stats;
+    let cols: [(&str, f32, (u8, u8, u8)); 3] = [
+        ("C", st.cpu / 100.0, load_color((90, 200, 250), st.cpu)),
+        ("G", st.gpu_pct.unwrap_or(0.0) / 100.0, load_color((255, 159, 10), st.gpu_pct.unwrap_or(0.0))),
+        ("R", st.ram_pct / 100.0, load_color((191, 90, 242), st.ram_pct)),
+    ];
+    let col_w = r.w / 3.0;
+    for (i, (label, frac, color)) in cols.iter().enumerate() {
+        let cx = r.x + col_w * (i as f32 + 0.5);
+        draw_ring(cv, cx - 10.0, r.cy(), 6.5, 2.2, *frac, *color, 1.0);
+        let pct = (frac * 100.0).round() as i32;
+        cv.text(&format!("{label}{pct}"), cx - 1.0, r.cy() + 4.0, 10.5, Weight::Semibold, WHITE, 0.9);
+    }
+    cv.unclip_rect();
+}
+
 /// Four bouncing bars while playing, four resting bars while paused. `right` is the bars' right edge.
 fn draw_eq(cv: &mut Canvas, right: f32, cy: f32, playing: bool, t: f32, color: (u8, u8, u8), a: f32) {
     const N: usize = 4;
@@ -324,11 +391,22 @@ fn draw_expanded(cv: &mut Canvas, sc: &Scene, a: f32) -> bool {
 
     draw_pin(cv, g.pin, sc.pinned, sc.hover == Hit::Pin, sc.accent, a);
 
-    // Left slot of the header: "Clear" on the clipboard tab, "Saved" after a settings change.
+    // Left slot of the header: "Clear" on the clipboard tab, the mode name on the Timer tab
+    // (click to cycle Countdown / Stopwatch / Reminders), "Saved" after a settings change.
     let clip_vis = 1.0 - (sc.tab_pos - 1.0).abs().min(1.0);
     if clip_vis > 0.01 && !sc.clip.is_empty() {
         let al = if sc.hover == Hit::Clear { 0.9 } else { 0.5 };
         cv.text("Clear", g.clear.x + 4.0, g.clear.y + 16.0, 11.5, Weight::Semibold, WHITE, al * clip_vis * a);
+    }
+    let timer_vis = 1.0 - (sc.tab_pos - 3.0).abs().min(1.0);
+    if timer_vis > 0.01 {
+        let label = match sc.timer.mode {
+            TimerMode::Countdown => "Timer",
+            TimerMode::Stopwatch => "Stopwatch",
+            TimerMode::Reminders => "Reminders",
+        };
+        let al = if sc.hover == Hit::Clear { 0.9 } else { 0.55 };
+        cv.text(label, g.clear.x + 4.0, g.clear.y + 16.0, 11.5, Weight::Semibold, sc.accent, al * timer_vis * a);
     }
     let set_vis = 1.0 - (sc.tab_pos - 4.0).abs().min(1.0);
     if set_vis > 0.01 && sc.saved > 0.01 {
@@ -487,9 +565,8 @@ fn draw_kind_icon(cv: &mut Canvas, e: &crate::history::Entry, cell: Rect, a: f32
 fn page_clip(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
     let g = sc.geo;
     let c = g.content;
-    let items = sc.clip.items();
 
-    if items.is_empty() {
+    if sc.clip.is_empty() {
         let cx = c.cx() + ox;
         draw_clip_icon(cv, cx, c.y + 34.0, 0.30 * a, sc.accent);
         cv.text_centered("Nothing copied yet", cx, c.y + 72.0, 14.0, Weight::Semibold, WHITE, 0.85 * a);
@@ -497,19 +574,32 @@ fn page_clip(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
         return;
     }
 
-    cv.clip_rect(Rect::new(c.x - 8.0, c.y, c.w + 16.0, c.h));
+    draw_search_box(cv, sc, ox, a);
+
+    let filtered = sc.clip.filter(sc.search);
+    let items = sc.clip.items();
+    if filtered.is_empty() {
+        let cx = c.cx() + ox;
+        let cy = c.y + CLIP_LIST_OFFSET + 30.0;
+        cv.text_centered("No matches", cx, cy, 13.0, Weight::Semibold, WHITE, 0.6 * a);
+        return;
+    }
+
+    let list_y = c.y + CLIP_LIST_OFFSET;
+    cv.clip_rect(Rect::new(c.x - 8.0, list_y, c.w + 16.0, c.h - CLIP_LIST_OFFSET));
     let first = sc.scroll.floor().max(0.0) as usize;
-    let last = (first + VISIBLE_ROWS + 1).min(items.len());
-    for i in first..last {
-        let e = &items[i];
-        let y = c.y + (i as f32 - sc.scroll) * ROW_H;
+    let last = (first + CLIP_VISIBLE_ROWS + 1).min(filtered.len());
+    for pos in first..last {
+        let abs = filtered[pos];
+        let e = &items[abs];
+        let y = list_y + (pos as f32 - sc.scroll) * ROW_H;
         let row = Rect::new(c.x + ox, y + 2.0, c.w, ROW_H - 4.0);
-        let hov = matches!(sc.hover, Hit::Row(j) if j == i);
+        let hov = matches!(sc.hover, Hit::Row(j) if j == pos);
         if hov {
             cv.fill_rrect(row, 9.0, white(0.08 * a));
         }
         let flash = match sc.flash {
-            Some((fi, v)) if fi == i => v,
+            Some((fi, v)) if fi == abs => v,
             _ => 0.0,
         };
         if flash > 0.0 {
@@ -563,14 +653,49 @@ fn page_clip(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
     }
     cv.unclip_rect();
 
-    scroll_thumb(cv, c, items.len(), sc.scroll, ox, a);
+    scroll_thumb(cv, Rect::new(c.x, list_y, c.w, c.h - CLIP_LIST_OFFSET), filtered.len(), CLIP_VISIBLE_ROWS, sc.scroll, ox, a);
+}
+
+/// Search box above the clipboard list: placeholder text, typed text, and a blinking caret
+/// while it has keyboard focus.
+fn draw_search_box(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
+    let r = Rect::new(sc.geo.search.x + ox, sc.geo.search.y, sc.geo.search.w, sc.geo.search.h);
+    let focused = sc.search_active;
+    cv.fill_rrect(r, 10.0, white((if focused { 0.14 } else { 0.08 }) * a));
+    if focused {
+        if let Some(p) = gfx::rrect(r.inflate(0.5), 10.5) {
+            cv.stroke(&p, 1.0, rgba(sc.accent, 0.8 * a), false);
+        }
+    }
+    draw_magnifier(cv, r.x + 14.0, r.cy(), a);
+    let tx = r.x + 26.0;
+    if sc.search.is_empty() {
+        cv.text("Search", tx, r.cy() + 4.0, 12.0, Weight::Regular, WHITE, 0.35 * a);
+    } else {
+        let w = cv.fit(sc.search, 12.5, Weight::Regular, r.w - 60.0);
+        cv.text(&w, tx, r.cy() + 4.0, 12.5, Weight::Regular, WHITE, 0.9 * a);
+        if focused && (sc.now * 2.0).fract() < 0.5 {
+            let cx = tx + cv.text_width(&w, 12.5, Weight::Regular) + 1.5;
+            cv.fill_rrect(Rect::new(cx, r.cy() - 7.0, 1.3, 14.0), 0.6, white(0.8 * a));
+        }
+        cv.text_centered("Esc", r.right() - 20.0, r.cy() + 3.5, 9.5, Weight::Semibold, WHITE, 0.35 * a);
+    }
+}
+
+/// Small magnifying-glass icon.
+fn draw_magnifier(cv: &mut Canvas, cx: f32, cy: f32, a: f32) {
+    let col = white(0.5 * a);
+    if let Some(p) = gfx::circle(cx - 1.0, cy - 1.0, 4.0) {
+        cv.stroke(&p, 1.4, col, false);
+    }
+    tri(cv, &[(cx + 2.6, cy + 2.6), (cx + 4.4, cy + 4.4), (cx + 3.5, cy + 5.3), (cx + 1.7, cy + 3.5)], col);
 }
 
 /// Thin scroll indicator to the right of a list page.
-fn scroll_thumb(cv: &mut Canvas, c: Rect, total: usize, scroll: f32, ox: f32, a: f32) {
-    if total > VISIBLE_ROWS {
-        let max_scroll = (total - VISIBLE_ROWS) as f32;
-        let th = (c.h * VISIBLE_ROWS as f32 / total as f32).max(16.0);
+fn scroll_thumb(cv: &mut Canvas, c: Rect, total: usize, visible: usize, scroll: f32, ox: f32, a: f32) {
+    if total > visible {
+        let max_scroll = (total - visible) as f32;
+        let th = (c.h * visible as f32 / total as f32).max(16.0);
         let ty = c.y + (c.h - th) * (scroll / max_scroll).clamp(0.0, 1.0);
         cv.fill_rrect(Rect::new(c.right() + 6.0 + ox, ty, 3.0, th), 1.5, white(0.22 * a));
     }
@@ -618,12 +743,17 @@ fn page_system(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
         Some(b) => (format!("{b}%"), battery_sub(st), battery_color(b, st.charging)),
         None => ("\u{2014}".to_string(), "No battery".to_string(), (120, 120, 128)),
     };
-    let cols: [(&str, String, String, (u8, u8, u8), f32); 3] = [
+    let (gpu_center, gpu_sub, gpu_col) = match st.gpu_pct {
+        Some(p) => (format!("{p:.0}%"), String::new(), load_color((255, 159, 10), p)),
+        None => ("\u{2014}".to_string(), "n/a".to_string(), (120, 120, 128)),
+    };
+    let cols: [(&str, String, String, (u8, u8, u8), f32); 4] = [
         ("CPU", format!("{:.0}%", st.cpu), format!("{} threads", st.threads), load_color((90, 200, 250), st.cpu), sc.gauges[0]),
+        ("GPU", gpu_center, gpu_sub, gpu_col, st.gpu_pct.unwrap_or(0.0) / 100.0),
         (
             "Memory",
             format!("{:.0}%", st.ram_pct),
-            format!("{:.1} / {:.0} GB", st.ram_used_gb, st.ram_total_gb),
+            format!("{:.1}/{:.0} GB", st.ram_used_gb, st.ram_total_gb),
             load_color((191, 90, 242), st.ram_pct),
             sc.gauges[1],
         ),
@@ -633,18 +763,25 @@ fn page_system(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
     for (i, (label, center, sub, color, frac)) in cols.iter().enumerate() {
         let cx = g.content.x + g.col_w * (i as f32 + 0.5) + ox;
         if let Some(track) = gfx::circle(cx, cy, r) {
-            cv.stroke(&track, 6.0, white(0.10 * a), false);
+            cv.stroke(&track, 5.0, white(0.10 * a), false);
         }
         let f = frac.clamp(0.0, 1.0);
         if f > 0.004 {
             if let Some(arc) = gfx::arc_path(cx, cy, r, -FRAC_PI_2, TAU * f.min(0.9999)) {
-                cv.stroke(&arc, 6.0, rgba(*color, a), true);
+                cv.stroke(&arc, 5.0, rgba(*color, a), true);
             }
         }
-        cv.text_centered(center, cx, cy + 5.5, 15.0, Weight::Semibold, WHITE, a);
-        cv.text_centered(label, cx, cy + r + 21.0, 12.0, Weight::Semibold, WHITE, 0.9 * a);
-        cv.text_centered(sub, cx, cy + r + 36.0, 10.5, Weight::Regular, WHITE, 0.45 * a);
+        cv.text_centered(center, cx, cy + 4.5, 12.5, Weight::Semibold, WHITE, a);
+        cv.text_centered(label, cx, cy + r + 18.0, 10.5, Weight::Semibold, WHITE, 0.9 * a);
+        if !sub.is_empty() {
+            cv.text_centered(sub, cx, cy + r + 31.0, 9.0, Weight::Regular, WHITE, 0.42 * a);
+        }
     }
+
+    // Network speed, centred under the rings.
+    let cx = g.content.cx() + ox;
+    let line = format!("\u{2193} {}   \u{2191} {}", fmt_rate(st.net_down_bps), fmt_rate(st.net_up_bps));
+    cv.text_centered(&line, cx, g.net_y, 11.0, Weight::Regular, WHITE, 0.55 * a);
 }
 
 // -------------------------------------------------------------------- timer
@@ -659,64 +796,110 @@ fn pill_button(cv: &mut Canvas, r: Rect, label: &str, hover: bool, primary: bool
 }
 
 fn page_timer(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
+    use crate::timer::REMIND_PRESETS;
     let g = sc.geo;
     let t = &sc.timer;
     let ring = g.t_ring;
     let (cx, cy) = (ring.cx() + ox, ring.cy());
-    let color = if t.finished { (255, 159, 10) } else { sc.accent };
-    let hov_ring = sc.hover == Hit::TimerToggle;
-    draw_ring(cv, cx, cy, 40.0, 7.0, if t.finished { 1.0 } else { t.frac }, color, a);
-    if hov_ring {
-        cv.fill_circle(cx, cy, 33.0, white(0.05 * a));
-    }
-    let clock = fmt_clock(t.secs);
-    let size = if t.secs >= 3600 { 16.0 } else { 21.0 };
-    cv.text_centered(&clock, cx, cy + 4.0, size, Weight::Semibold, WHITE, a);
-    let state = if t.finished {
-        "Time is up"
-    } else if t.running {
-        "Running"
-    } else if t.frac < 0.999 {
-        "Paused"
-    } else {
-        "Ready"
-    };
-    cv.text_centered(state, cx, cy + 22.0, 10.5, Weight::Regular, WHITE, 0.5 * a);
-
-    // Preset chips.
-    for (i, m) in TIMER_PRESETS.iter().enumerate() {
-        let r = g.t_presets[i];
-        let r = Rect::new(r.x + ox, r.y, r.w, r.h);
-        let hov = sc.hover == Hit::Preset(i);
-        let sel = t.total_min == *m;
-        if sel {
-            cv.fill_rrect(r, 13.0, rgba(sc.accent, 0.25 * a));
-        } else {
-            cv.fill_rrect(r, 13.0, white((if hov { 0.16 } else { 0.08 }) * a));
-        }
-        let al = if sel || hov { 1.0 } else { 0.75 };
-        cv.text_centered(&format!("{m}m"), r.cx(), r.y + 17.5, 12.0, Weight::Semibold, WHITE, al * a);
-    }
-
-    // Transport buttons.
     let off = |r: Rect| Rect::new(r.x + ox, r.y, r.w, r.h);
-    pill_button(cv, off(g.t_minus), "-1m", sc.hover == Hit::TimerMinus, false, a);
-    let label = if t.finished {
-        "Restart"
-    } else if t.running {
-        "Pause"
-    } else if t.frac < 0.999 {
-        "Resume"
-    } else {
-        "Start"
-    };
-    pill_button(cv, off(g.t_toggle), label, sc.hover == Hit::TimerToggle, true, a);
-    pill_button(cv, off(g.t_plus), "+1m", sc.hover == Hit::TimerPlus, false, a);
-    pill_button(cv, off(g.t_reset), "Reset", sc.hover == Hit::TimerReset, false, a);
-    cv.text("Scroll to change the time", g.t_presets[0].x + ox, g.content.y + 104.0, 10.5, Weight::Regular, WHITE, 0.32 * a);
+
+    match t.mode {
+        TimerMode::Reminders => {
+            // The ring area becomes a short list of pending reminders instead of a clock.
+            if t.reminders.is_empty() {
+                draw_bell(cv, cx, cy - 6.0, 1.3, 0.35 * a);
+                cv.text_centered("No reminders set", cx, cy + 24.0, 12.0, Weight::Regular, WHITE, 0.5 * a);
+            } else {
+                for (i, secs) in t.reminders.iter().take(3).enumerate() {
+                    let y = ring.y + 14.0 + i as f32 * 20.0;
+                    cv.text_centered(&format!("Reminder \u{b7} {}", fmt_clock(*secs)), cx, y, 12.5, Weight::Semibold, WHITE, a);
+                }
+                if t.reminders.len() > 3 {
+                    cv.text_centered(&format!("+{} more", t.reminders.len() - 3), cx, ring.y + 14.0 + 60.0, 10.0, Weight::Regular, WHITE, 0.45 * a);
+                }
+            }
+        }
+        TimerMode::Stopwatch => {
+            draw_ring(cv, cx, cy, 40.0, 7.0, 1.0, sc.accent, if t.running { a } else { 0.35 * a });
+            let clock = fmt_clock(t.secs);
+            let size = if t.secs >= 3600 { 16.0 } else { 21.0 };
+            cv.text_centered(&clock, cx, cy + 4.0, size, Weight::Semibold, WHITE, a);
+            cv.text_centered(if t.running { "Running" } else { "Paused" }, cx, cy + 22.0, 10.5, Weight::Regular, WHITE, 0.5 * a);
+        }
+        TimerMode::Countdown => {
+            let color = if t.finished { (255, 159, 10) } else { sc.accent };
+            if sc.hover == Hit::TimerToggle {
+                cv.fill_circle(cx, cy, 33.0, white(0.05 * a));
+            }
+            draw_ring(cv, cx, cy, 40.0, 7.0, if t.finished { 1.0 } else { t.frac }, color, a);
+            let clock = fmt_clock(t.secs);
+            let size = if t.secs >= 3600 { 16.0 } else { 21.0 };
+            cv.text_centered(&clock, cx, cy + 4.0, size, Weight::Semibold, WHITE, a);
+            let state = if t.finished {
+                "Time is up"
+            } else if t.running {
+                "Running"
+            } else if t.frac < 0.999 {
+                "Paused"
+            } else {
+                "Ready"
+            };
+            cv.text_centered(state, cx, cy + 22.0, 10.5, Weight::Regular, WHITE, 0.5 * a);
+        }
+    }
+
+    // Preset chips: minutes to count down to (Countdown) or to add as a reminder (Reminders).
+    if t.mode != TimerMode::Stopwatch {
+        let n = if t.mode == TimerMode::Reminders { REMIND_PRESETS.len() } else { TIMER_PRESETS.len() };
+        for i in 0..n {
+            let r = off(g.t_presets[i]);
+            let hov = sc.hover == Hit::Preset(i);
+            let sel = t.mode == TimerMode::Countdown && t.total_min == TIMER_PRESETS[i];
+            if sel {
+                cv.fill_rrect(r, 13.0, rgba(sc.accent, 0.25 * a));
+            } else {
+                cv.fill_rrect(r, 13.0, white((if hov { 0.16 } else { 0.08 }) * a));
+            }
+            let al = if sel || hov { 1.0 } else { 0.75 };
+            let mins = if t.mode == TimerMode::Reminders { REMIND_PRESETS[i] } else { TIMER_PRESETS[i] };
+            let label = if t.mode == TimerMode::Reminders { format!("+{mins}m") } else { format!("{mins}m") };
+            cv.text_centered(&label, r.cx(), r.y + 17.5, 12.0, Weight::Semibold, WHITE, al * a);
+        }
+    }
+
+    // Transport row: Countdown gets the full set; Stopwatch only start/reset; Reminders only
+    // a "clear all" (via the reset button) once something is pending.
+    match t.mode {
+        TimerMode::Countdown => {
+            pill_button(cv, off(g.t_minus), "-1m", sc.hover == Hit::TimerMinus, false, a);
+            let label = if t.finished {
+                "Restart"
+            } else if t.running {
+                "Pause"
+            } else if t.frac < 0.999 {
+                "Resume"
+            } else {
+                "Start"
+            };
+            pill_button(cv, off(g.t_toggle), label, sc.hover == Hit::TimerToggle, true, a);
+            pill_button(cv, off(g.t_plus), "+1m", sc.hover == Hit::TimerPlus, false, a);
+            pill_button(cv, off(g.t_reset), "Reset", sc.hover == Hit::TimerReset, false, a);
+            cv.text("Scroll to change the time", g.t_presets[0].x + ox, g.content.y + 104.0, 10.5, Weight::Regular, WHITE, 0.32 * a);
+        }
+        TimerMode::Stopwatch => {
+            let label = if t.running { "Pause" } else { "Start" };
+            pill_button(cv, off(g.t_toggle), label, sc.hover == Hit::TimerToggle, true, a);
+            pill_button(cv, off(g.t_reset), "Reset", sc.hover == Hit::TimerReset, false, a);
+        }
+        TimerMode::Reminders => {
+            if !t.reminders.is_empty() {
+                pill_button(cv, off(g.t_reset), "Clear all", sc.hover == Hit::TimerReset, false, a);
+            }
+        }
+    }
 }
 
-// ----------------------------------------------------------------- settings
+// ----------------------------------------------------------------- settings// ----------------------------------------------------------------- settings
 fn page_settings(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
     let g = sc.geo;
     let c = g.content;
@@ -807,7 +990,7 @@ fn page_settings(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
         }
     }
     cv.unclip_rect();
-    scroll_thumb(cv, c, settings::ROWS.len(), sc.sscroll, ox, a);
+    scroll_thumb(cv, c, settings::ROWS.len(), VISIBLE_ROWS, sc.sscroll, ox, a);
 }
 
 // -------------------------------------------------------------------- icons

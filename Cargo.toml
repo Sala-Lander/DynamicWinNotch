@@ -17,8 +17,9 @@ arboard = { version = "3.4", default-features = false, features = ["image-data"]
 # Deflate for the clipboard image history (pure Rust, tiny). Images sit compressed in RAM.
 miniz_oxide = "0.8"
 
-# The `windows` crate is used ONLY for WinRT (Global System Media Transport Controls and
-# thumbnail decoding). All plain Win32 calls are hand-declared in src/ffi.rs.
+# The `windows` crate is used ONLY for WinRT (Global System Media Transport Controls, thumbnail
+# decoding, and the toast-notification listener). All plain Win32 calls are hand-declared in
+# src/ffi.rs (GPU/network stats go through PDH, hand-declared there too).
 [dependencies.windows]
 version = "0.58"
 features = [
@@ -28,6 +29,11 @@ features = [
     "Media_Control",
     "Graphics_Imaging",
     "Storage_Streams",
+    "UI_Notifications",
+    "UI_Notifications_Management",
+    "Data_Xml_Dom",
+    # Needed for UserNotification::AppInfo() -> ApplicationModel::AppInfo (app display name).
+    "ApplicationModel",
 ]
 
 [profile.release]

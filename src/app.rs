@@ -9,18 +9,21 @@
 //! 4-second housekeeping tick.
 
 use crate::clip::{self, ClipCmd, ClipFlags, ClipItem};
-use crate::config::{self, Config, ExpandOn};
-use crate::ffi::{MessageBeep, PostQuitMessage, MB_ICONASTERISK, WM_LBUTTONUP, WM_RBUTTONUP};
+use crate::config::{self, Config, ExpandOn, FullscreenMode};
+use crate::ffi::{MessageBeep, PostQuitMessage, MB_ICONASTERISK, VK_BACK, VK_ESCAPE, VK_RETURN, WM_LBUTTONUP, WM_RBUTTONUP};
 use crate::gfx::{pixmap_from_rgba, Canvas};
 use crate::history::{Entry, History, Kind};
-use crate::layout::{self, Geo, Hit, Rect, Tab, COLLAPSED, EXPANDED, PEEK, TAB_COUNT, TIMER_PRESETS, VISIBLE_ROWS};
+use crate::layout::{
+    self, Geo, Hit, Rect, Tab, CLIP_VISIBLE_ROWS, COLLAPSED, EXPANDED, PEEK, TAB_COUNT, TIMER_PRESETS, VISIBLE_ROWS,
+};
 use crate::media::{self, Cmd, MediaView, Msg, Shared};
+use crate::notify;
 use crate::power::{PowerEvent, Watcher};
 use crate::settings::{self, Action};
 use crate::spring::Spring;
 use crate::sys::{self, Sampler};
-use crate::timer::Timer;
-use crate::ui::{self, PeekInfo, PeekKind, PowerIcon, Scene, TimerView};
+use crate::timer::{add_reminder, next_reminder_wake, take_due, Stopwatch, Timer, REMIND_PRESETS};
+use crate::ui::{self, PeekInfo, PeekKind, PowerIcon, Scene, TimerMode, TimerView};
 use crate::util::{clamp01, fmt_bytes, single_line};
 use crate::win::{self, Btn, Ev, Tray, Win};
 use std::sync::mpsc::{Receiver, Sender};
@@ -84,11 +87,26 @@ pub struct App {
     clip_flags: Arc<ClipFlags>,
     sampler: Sampler,
     timer: Timer,
+    timer_mode: TimerMode,
+    stopwatch: Stopwatch,
+    reminders: Vec<u64>,
     last_timer_secs: u64,
     power: Watcher,
     autostart: bool,
     saved_at: Option<Instant>,
     last_sample: Instant,
+
+    /// Clipboard search box.
+    search: String,
+    search_active: bool,
+
+    notify_tx: Sender<notify::Msg>,
+    notify_shared: Arc<Mutex<notify::Shared>>,
+    notify_seen_gen: u64,
+
+    /// Click-through "game bar" shown over full-screen apps when `fullscreen_mode` is
+    /// `GameBar` instead of the normal hide behaviour.
+    game_bar: bool,
 
     start: Instant,
     last_step: Instant,
@@ -126,6 +144,9 @@ impl App {
         let clip_flags = ClipFlags::new(cfg.clip_images, cfg.privacy_filter);
         let (clip_tx, clip_rx) = clip::spawn(win.hwnd, clip_flags.clone());
         let _ = clip_tx.send(ClipCmd::Read); // seed the history with whatever is on the clipboard now
+        // Best-effort: silently does nothing if access to the notification listener is denied
+        // (common for an unpackaged .exe) - see notify.rs.
+        let (notify_tx, notify_shared) = notify::spawn(win.hwnd);
 
         let now = Instant::now();
         let tab = cfg.start_tab;
@@ -166,11 +187,20 @@ impl App {
             clip_flags,
             sampler: Sampler::new(),
             timer: Timer::default(),
+            timer_mode: TimerMode::default(),
+            stopwatch: Stopwatch::default(),
+            reminders: Vec::new(),
             last_timer_secs: u64::MAX,
             power: Watcher::new(sys::power_now()),
             autostart: win::autostart_enabled(),
             saved_at: None,
             last_sample: now,
+            search: String::new(),
+            search_active: false,
+            notify_tx,
+            notify_shared,
+            notify_seen_gen: 0,
+            game_bar: false,
             start: now,
             last_step: now,
             last_render: now.checked_sub(Duration::from_secs(1)).unwrap_or(now),
@@ -188,6 +218,7 @@ impl App {
     pub fn shutdown(&mut self) {
         self.tray.remove();
         let _ = self.media_tx.send(Msg::Quit);
+        let _ = self.notify_tx.send(notify::Msg::Quit);
         self.win.destroy();
     }
 
@@ -212,7 +243,8 @@ impl App {
             self.dirty = true;
         }
         self.update_periodic(now);
-        self.win.set_click_through(!self.expanded && self.cfg.expand_on == ExpandOn::Hover);
+        self.win
+            .set_click_through(self.game_bar || (!self.expanded && self.cfg.expand_on == ExpandOn::Hover));
 
         // Render at most `fps_cap` times per second.
         let min_iv = Duration::from_secs_f32(1.0 / self.cfg.fps_cap.max(1) as f32);
@@ -302,7 +334,7 @@ impl App {
         self.sh.set_target(h);
         self.peek_s.set_target(if want_peek { 1.0 } else { 0.0 });
         self.tab_s.set_target(self.tab.index() as f32);
-        let max_scroll = self.clip.len().saturating_sub(VISIBLE_ROWS) as f32;
+        let max_scroll = self.filtered_clip().len().saturating_sub(CLIP_VISIBLE_ROWS) as f32;
         self.scroll_target = self.scroll_target.clamp(0.0, max_scroll);
         self.scroll_s.set_target(self.scroll_target);
         let max_s = settings::ROWS.len().saturating_sub(VISIBLE_ROWS) as f32;
@@ -320,7 +352,8 @@ impl App {
     }
 
     fn update_hover(&mut self, now: Instant) {
-        if !self.win.is_visible() {
+        if !self.win.is_visible() || self.game_bar {
+            // Click-through and mouse-blind by design while the game bar is up.
             self.hover_since = None;
             return;
         }
@@ -356,10 +389,17 @@ impl App {
         }
     }
 
+    /// Absolute history indices of the entries that match the current search text, in display
+    /// order. `Hit::Row` carries a position into *this* list, never a raw history index.
+    fn filtered_clip(&self) -> Vec<usize> {
+        self.clip.filter(&self.search)
+    }
+
     /// What is under (x, y) on the current tab (logical window coordinates).
     fn hit_at(&self, x: f32, y: f32) -> Hit {
         let (scroll, rows) = match self.tab {
             Tab::Settings => (self.sscroll_s.pos, settings::ROWS.len()),
+            Tab::Clipboard => (self.scroll_s.pos, self.filtered_clip().len()),
             _ => (self.scroll_s.pos, self.clip.len()),
         };
         layout::hit_test(&self.geo, self.tab, x, y, scroll, rows)
@@ -401,6 +441,9 @@ impl App {
     fn set_tab(&mut self, t: Tab) {
         if t == self.tab {
             return;
+        }
+        if self.tab == Tab::Clipboard {
+            self.search_active = false; // leaving the tab drops the search box's keyboard focus
         }
         self.tab = t;
         if t == Tab::System {
@@ -452,7 +495,8 @@ impl App {
                 self.dirty = true;
             }
         }
-        if self.expanded && self.tab == Tab::System && now.saturating_duration_since(self.last_sample) >= SAMPLE_EVERY {
+        let want_sample = (self.expanded && self.tab == Tab::System) || self.game_bar;
+        if want_sample && now.saturating_duration_since(self.last_sample) >= SAMPLE_EVERY {
             self.sample_now();
         }
         self.update_timer(now);
@@ -478,13 +522,21 @@ impl App {
         if self.timer.tick(t) {
             self.on_timer_done(now);
         }
-        // The shown time only changes once per second: repaint exactly then.
-        let secs = self.timer.display_secs(t);
+        // The shown time only changes once per second: repaint exactly then, whichever mode
+        // is currently on screen (the countdown, or the stopwatch while it is running).
+        let secs = match self.timer_mode {
+            TimerMode::Stopwatch => self.stopwatch.elapsed(t) / 1000,
+            _ => self.timer.display_secs(t),
+        };
         if secs != self.last_timer_secs {
             self.last_timer_secs = secs;
-            if self.timer.running() {
+            if self.timer.running() || (self.timer_mode == TimerMode::Stopwatch && self.stopwatch.running()) {
                 self.dirty = true;
             }
+        }
+        let due = take_due(&mut self.reminders, t);
+        if !due.is_empty() {
+            self.on_reminder_due(due.len(), now);
         }
     }
 
@@ -498,29 +550,99 @@ impl App {
         self.dirty = true;
     }
 
+    fn on_reminder_due(&mut self, count: usize, now: Instant) {
+        if self.cfg.timer_sound {
+            unsafe { MessageBeep(MB_ICONASTERISK) };
+        }
+        let line2 = if count == 1 { "Reminder".to_string() } else { format!("{count} reminders") };
+        let info = PeekInfo::new(PeekKind::Timer, "Time's up".to_string(), line2);
+        self.start_peek(info, TIMER_PEEK_MS, now);
+        self.dirty = true;
+    }
+
+    /// Cycle Countdown -> Stopwatch -> Reminders -> Countdown (the Timer tab's "Clear" slot).
+    fn cycle_timer_mode(&mut self) {
+        self.timer_mode = match self.timer_mode {
+            TimerMode::Countdown => TimerMode::Stopwatch,
+            TimerMode::Stopwatch => TimerMode::Reminders,
+            TimerMode::Reminders => TimerMode::Countdown,
+        };
+        self.last_timer_secs = u64::MAX;
+        self.dirty = true;
+    }
+
     fn timer_view(&self, now: Instant) -> TimerView {
         let t = self.clock_ms(now);
+        let (running, finished, secs, frac) = match self.timer_mode {
+            TimerMode::Countdown => (self.timer.running(), self.timer.finished(), self.timer.display_secs(t), self.timer.fraction(t)),
+            TimerMode::Stopwatch => (self.stopwatch.running(), false, self.stopwatch.elapsed(t) / 1000, 1.0),
+            TimerMode::Reminders => (false, false, 0, 1.0),
+        };
+        let reminders = self.reminders.iter().map(|&due| due.saturating_sub(t).div_ceil(1000)).collect();
         TimerView {
-            running: self.timer.running(),
-            finished: self.timer.finished(),
-            secs: self.timer.display_secs(t),
-            frac: self.timer.fraction(t),
+            mode: self.timer_mode,
+            running,
+            finished,
+            secs,
+            frac,
             total_min: (self.timer.total_ms() / 60_000) as u32,
+            reminders,
         }
     }
 
-    /// Hide for full-screen apps; keep the window above other topmost windows.
-    fn housekeeping(&mut self) {
-        let hide = self.cfg.hide_fullscreen && win::fullscreen_app_active();
-        if hide != self.fs_hidden {
-            self.fs_hidden = hide;
-            self.win.set_visible(!hide);
-            if !hide {
-                self.dirty = true;
-            }
+    // --------------------------------------------------------- notifications
+    fn on_notify(&mut self, now: Instant) {
+        let (gen, notif) = {
+            let g = self.notify_shared.lock().unwrap_or_else(|e| e.into_inner());
+            (g.generation, g.latest.clone())
+        };
+        if gen == self.notify_seen_gen {
+            return;
         }
-        if !hide {
-            self.win.raise();
+        self.notify_seen_gen = gen;
+        if !self.cfg.notifications {
+            return;
+        }
+        if let Some(n) = notif {
+            let line2 = if n.body.is_empty() { n.app.clone() } else { format!("{} \u{b7} {}", n.app, single_line(&n.body, 60)) };
+            let title = if n.title.is_empty() { n.app.clone() } else { single_line(&n.title, 60) };
+            let info = PeekInfo::new(PeekKind::Notification, title, line2);
+            self.start_peek(info, PEEK_MS, now);
+        }
+    }
+
+    /// Hide for full-screen apps, or show a tiny click-through game bar instead - keep the
+    /// window above other topmost windows either way.
+    fn housekeeping(&mut self) {
+        let fullscreen = self.cfg.hide_fullscreen && win::fullscreen_app_active();
+        match self.cfg.fullscreen_mode {
+            FullscreenMode::GameBar => {
+                if fullscreen != self.game_bar {
+                    self.game_bar = fullscreen;
+                    self.dirty = true;
+                }
+                if self.fs_hidden {
+                    self.fs_hidden = false;
+                    self.win.set_visible(true);
+                }
+                self.win.raise();
+            }
+            FullscreenMode::Hide => {
+                if self.game_bar {
+                    self.game_bar = false;
+                    self.dirty = true;
+                }
+                if fullscreen != self.fs_hidden {
+                    self.fs_hidden = fullscreen;
+                    self.win.set_visible(!fullscreen);
+                    if !fullscreen {
+                        self.dirty = true;
+                    }
+                }
+                if !fullscreen {
+                    self.win.raise();
+                }
+            }
         }
     }
 
@@ -582,10 +704,21 @@ impl App {
         if let Some(p) = self.periodic_interval() {
             consider(self.last_periodic + p);
         }
-        if self.expanded && self.tab == Tab::System {
+        if (self.expanded && self.tab == Tab::System) || self.game_bar {
             consider(self.last_sample + SAMPLE_EVERY);
         }
         if let Some(w) = self.timer.next_wake_ms(self.clock_ms(now)) {
+            consider(now + Duration::from_millis(w));
+        }
+        if self.timer_mode == TimerMode::Stopwatch && self.stopwatch.running() {
+            let t = self.clock_ms(now);
+            let to_boundary = match self.stopwatch.elapsed(t) % 1000 {
+                0 => 1000,
+                r => 1000 - r,
+            };
+            consider(now + Duration::from_millis(to_boundary + 2));
+        }
+        if let Some(w) = next_reminder_wake(&self.reminders, self.clock_ms(now)) {
             consider(now + Duration::from_millis(w));
         }
         if let Some(t0) = self.saved_at {
@@ -624,7 +757,44 @@ impl App {
                 }
                 Ev::TaskbarCreated => self.tray.re_add(),
                 Ev::Power => self.on_power(now),
+                Ev::Char(c) => self.on_search_char(c),
+                Ev::Key(vk) => self.on_search_key(vk),
+                Ev::LostFocus => self.search_active = false,
+                Ev::Notify => self.on_notify(now),
             }
+        }
+    }
+
+    // ---------------------------------------------------------- clip search
+    fn on_search_char(&mut self, c: char) {
+        if !self.search_active {
+            return;
+        }
+        // One extra line of defence beyond the OS-level length limits further up the chain.
+        if self.search.chars().count() < 60 {
+            self.search.push(c);
+            self.scroll_target = 0.0;
+            self.dirty = true;
+        }
+    }
+
+    fn on_search_key(&mut self, vk: usize) {
+        if !self.search_active {
+            return;
+        }
+        if vk == VK_BACK {
+            if self.search.pop().is_some() {
+                self.scroll_target = 0.0;
+                self.dirty = true;
+            }
+        } else if vk == VK_ESCAPE {
+            self.search.clear();
+            self.search_active = false;
+            self.scroll_target = 0.0;
+            self.dirty = true;
+        } else if vk == VK_RETURN {
+            self.search_active = false;
+            self.dirty = true;
         }
     }
 
@@ -640,6 +810,9 @@ impl App {
         if hit == Hit::None {
             return;
         }
+        if hit != Hit::Search && self.search_active {
+            self.search_active = false; // clicking anything else drops the search box's focus
+        }
         // Tiny "squash" feedback for any press inside the pill; released by a timer, so a button
         // released outside the window cannot leave it stuck.
         self.press_s.set_target(1.0);
@@ -649,8 +822,16 @@ impl App {
             (Btn::Left, Hit::Tab(i)) => self.set_tab(Tab::from_index(i)),
             (Btn::Left, Hit::Pin) => self.toggle_pin(),
             (Btn::Left, Hit::Clear) => {
-                self.clip.clear_unpinned();
-                self.scroll_target = 0.0;
+                if self.tab == Tab::Timer {
+                    self.cycle_timer_mode();
+                } else {
+                    self.clip.clear_unpinned();
+                    self.scroll_target = 0.0;
+                }
+            }
+            (Btn::Left, Hit::Search) => {
+                self.search_active = true;
+                self.win.focus_for_typing();
             }
             (Btn::Left, Hit::Prev) => self.media_cmd(Cmd::Prev),
             (Btn::Left, Hit::Next) => self.media_cmd(Cmd::Next),
@@ -672,21 +853,60 @@ impl App {
                     self.media.at = now;
                 }
             }
-            (Btn::Left, Hit::Row(i)) => self.copy_row(i, now),
+            (Btn::Left, Hit::Row(pos)) => {
+                if let Some(&abs) = self.filtered_clip().get(pos) {
+                    self.copy_row(abs, now);
+                }
+            }
             (Btn::Left, Hit::Set(row, sub)) => self.on_setting(row, sub as usize, now),
-            (Btn::Left, Hit::Preset(i)) => {
-                self.timer.start_preset(TIMER_PRESETS[i.min(TIMER_PRESETS.len() - 1)], self.clock_ms(now));
-                self.last_timer_secs = u64::MAX;
+            (Btn::Left, Hit::Preset(i)) => match self.timer_mode {
+                TimerMode::Countdown => {
+                    self.timer.start_preset(TIMER_PRESETS[i.min(TIMER_PRESETS.len() - 1)], self.clock_ms(now));
+                    self.last_timer_secs = u64::MAX;
+                }
+                TimerMode::Reminders => {
+                    let mins = REMIND_PRESETS[i.min(REMIND_PRESETS.len() - 1)];
+                    let t = self.clock_ms(now);
+                    add_reminder(&mut self.reminders, t, mins);
+                }
+                TimerMode::Stopwatch => {}
+            },
+            (Btn::Left, Hit::TimerToggle) => match self.timer_mode {
+                TimerMode::Countdown => {
+                    self.timer.toggle(self.clock_ms(now));
+                    self.last_timer_secs = u64::MAX;
+                }
+                TimerMode::Stopwatch => {
+                    self.stopwatch.toggle(self.clock_ms(now));
+                    self.last_timer_secs = u64::MAX;
+                }
+                TimerMode::Reminders => {}
+            },
+            (Btn::Left, Hit::TimerMinus) => {
+                if self.timer_mode == TimerMode::Countdown {
+                    self.timer.adjust(-1, self.clock_ms(now));
+                }
             }
-            (Btn::Left, Hit::TimerToggle) => {
-                self.timer.toggle(self.clock_ms(now));
-                self.last_timer_secs = u64::MAX;
+            (Btn::Left, Hit::TimerPlus) => {
+                if self.timer_mode == TimerMode::Countdown {
+                    self.timer.adjust(1, self.clock_ms(now));
+                }
             }
-            (Btn::Left, Hit::TimerMinus) => self.timer.adjust(-1, self.clock_ms(now)),
-            (Btn::Left, Hit::TimerPlus) => self.timer.adjust(1, self.clock_ms(now)),
-            (Btn::Left, Hit::TimerReset) => self.timer.reset(),
-            (Btn::Right, Hit::Row(i)) => self.clip.toggle_pin(i),
-            (Btn::Middle, Hit::Row(i)) => self.clip.remove(i),
+            (Btn::Left, Hit::TimerReset) => match self.timer_mode {
+                TimerMode::Countdown => self.timer.reset(),
+                TimerMode::Stopwatch => self.stopwatch.reset(),
+                TimerMode::Reminders => self.reminders.clear(),
+            },
+            (Btn::Right, Hit::Row(pos)) => {
+                if let Some(&abs) = self.filtered_clip().get(pos) {
+                    self.clip.toggle_pin(abs);
+                }
+            }
+            (Btn::Middle, Hit::Row(pos)) => {
+                if let Some(&abs) = self.filtered_clip().get(pos) {
+                    self.clip.remove(abs);
+                }
+            }
             _ => {}
         }
         self.dirty = true;
@@ -706,12 +926,12 @@ impl App {
             let next = (self.tab.index() as i32 - notches.signum() as i32).clamp(0, TAB_COUNT as i32 - 1) as usize;
             self.set_tab(Tab::from_index(next));
         } else if self.tab == Tab::Clipboard {
-            let max = self.clip.len().saturating_sub(VISIBLE_ROWS) as f32;
+            let max = self.filtered_clip().len().saturating_sub(CLIP_VISIBLE_ROWS) as f32;
             self.scroll_target = (self.scroll_target - notches).clamp(0.0, max);
         } else if self.tab == Tab::Settings {
             let max = settings::ROWS.len().saturating_sub(VISIBLE_ROWS) as f32;
             self.sscroll_target = (self.sscroll_target - notches).clamp(0.0, max);
-        } else if self.tab == Tab::Timer {
+        } else if self.tab == Tab::Timer && self.timer_mode == TimerMode::Countdown {
             let now = Instant::now();
             self.timer.adjust(notches.signum() as i32, self.clock_ms(now));
             self.last_timer_secs = u64::MAX;
@@ -944,6 +1164,9 @@ impl App {
             stats: &self.sampler.stats,
             accent,
             peek: self.peek.as_ref().map(|(p, _)| p),
+            search: &self.search,
+            search_active: self.search_active,
+            game_bar: self.game_bar,
         };
         self.marquee = ui::draw(&mut self.cv, &scene);
         self.win.present(self.cv.pm.data());

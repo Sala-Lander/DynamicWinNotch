@@ -2,7 +2,7 @@
 //! sits and what a click on it does to the `Config`. No OS calls and no drawing, so the whole
 //! thing is unit-tested; `ui.rs` paints it and `layout.rs` hit-tests it from the same numbers.
 
-use crate::config::{Config, ExpandOn};
+use crate::config::{Config, ExpandOn, FullscreenMode};
 use crate::layout::{Rect, Style, ROW_H};
 
 /// Accent swatches offered in the UI (sub-control 0 is "auto", 1.. map to these).
@@ -29,6 +29,8 @@ pub enum Id {
     Fps,
     Autostart,
     ConfigFile,
+    Notifications,
+    FullscreenMode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,7 +53,7 @@ pub struct Row {
     pub ctl: Ctl,
 }
 
-pub const ROWS: [Row; 16] = [
+pub const ROWS: [Row; 18] = [
     Row { id: Id::ExpandOn, label: "Expand on", ctl: Ctl::Seg(&["Hover", "Click"]) },
     Row { id: Id::Style, label: "Style", ctl: Ctl::Seg(&["Notch", "Island"]) },
     Row { id: Id::Accent, label: "Accent colour", ctl: Ctl::Swatch },
@@ -61,9 +63,11 @@ pub const ROWS: [Row; 16] = [
     Row { id: Id::PowerAlerts, label: "Battery & charger alerts", ctl: Ctl::Toggle },
     Row { id: Id::TimerSound, label: "Timer sound", ctl: Ctl::Toggle },
     Row { id: Id::ClipImages, label: "Clipboard images", ctl: Ctl::Toggle },
+    Row { id: Id::Notifications, label: "Notification peeks", ctl: Ctl::Toggle },
     Row { id: Id::Privacy, label: "Skip password managers", ctl: Ctl::Toggle },
     Row { id: Id::HistorySize, label: "Clipboard history", ctl: Ctl::Step },
     Row { id: Id::HideFullscreen, label: "Hide in full screen", ctl: Ctl::Toggle },
+    Row { id: Id::FullscreenMode, label: "Full screen behaviour", ctl: Ctl::Seg(&["Hide", "Game bar"]) },
     Row { id: Id::HoverDelay, label: "Hover delay", ctl: Ctl::Step },
     Row { id: Id::Fps, label: "Frame rate", ctl: Ctl::Seg(&["30", "60", "120"]) },
     Row { id: Id::Autostart, label: "Start with Windows", ctl: Ctl::Toggle },
@@ -156,6 +160,7 @@ pub fn toggle_on(id: Id, v: &View) -> bool {
         Id::ClipImages => c.clip_images,
         Id::Privacy => c.privacy_filter,
         Id::HideFullscreen => c.hide_fullscreen,
+        Id::Notifications => c.notifications,
         Id::Autostart => v.autostart,
         _ => false,
     }
@@ -167,6 +172,7 @@ pub fn seg_selected(id: Id, c: &Config) -> Option<usize> {
         Id::ExpandOn => Some((c.expand_on == ExpandOn::Click) as usize),
         Id::Style => Some((c.style == Style::Island) as usize),
         Id::Fps => FPS_STEPS.iter().position(|&f| f == c.fps_cap),
+        Id::FullscreenMode => Some((c.fullscreen_mode == FullscreenMode::GameBar) as usize),
         _ => None,
     }
 }
@@ -217,8 +223,10 @@ pub fn apply(c: &mut Config, autostart: bool, id: Id, sub: usize) -> Action {
         Id::PowerAlerts => c.power_alerts = !c.power_alerts,
         Id::TimerSound => c.timer_sound = !c.timer_sound,
         Id::ClipImages => c.clip_images = !c.clip_images,
+        Id::Notifications => c.notifications = !c.notifications,
         Id::Privacy => c.privacy_filter = !c.privacy_filter,
         Id::HideFullscreen => c.hide_fullscreen = !c.hide_fullscreen,
+        Id::FullscreenMode => c.fullscreen_mode = if sub == 1 { FullscreenMode::GameBar } else { FullscreenMode::Hide },
         Id::HistorySize => {
             let d = if sub == 0 { -1 } else { 1 };
             c.history_size = step(c.history_size as i64, d, 10, 10, 100) as usize;
@@ -338,6 +346,20 @@ mod tests {
         assert_eq!(step_text(Id::HoverDelay, &c), "20 ms");
         c.history_size = 30;
         assert_eq!(step_text(Id::HistorySize, &c), "30");
+    }
+
+    #[test]
+    fn notifications_and_fullscreen_mode() {
+        let mut c = Config::default();
+        assert!(!toggle_on(Id::Notifications, &View { cfg: &c, autostart: false }));
+        assert_eq!(apply(&mut c, false, Id::Notifications, 0), Action::Changed);
+        assert!(toggle_on(Id::Notifications, &View { cfg: &c, autostart: false }));
+
+        assert_eq!(seg_selected(Id::FullscreenMode, &c), Some(0));
+        assert_eq!(apply(&mut c, false, Id::FullscreenMode, 1), Action::Changed);
+        assert_eq!(c.fullscreen_mode, FullscreenMode::GameBar);
+        assert_eq!(seg_selected(Id::FullscreenMode, &c), Some(1));
+        assert_eq!(apply(&mut c, false, Id::FullscreenMode, 1), Action::Nothing);
     }
 
     #[test]

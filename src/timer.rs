@@ -123,6 +123,64 @@ impl Timer {
     }
 }
 
+pub const MAX_REMINDERS: usize = 5;
+/// Minutes offered by the three reminder quick-add buttons.
+pub const REMIND_PRESETS: [u32; 3] = [10, 30, 60];
+
+/// A simple stopwatch: counts up, pause/resume keeps the accumulated time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stopwatch {
+    running_since: Option<u64>,
+    accumulated: u64,
+}
+
+impl Stopwatch {
+    pub fn running(&self) -> bool {
+        self.running_since.is_some()
+    }
+
+    pub fn elapsed(&self, now: u64) -> u64 {
+        match self.running_since {
+            Some(t0) => self.accumulated + now.saturating_sub(t0),
+            None => self.accumulated,
+        }
+    }
+
+    /// Start / pause, keeping the elapsed time either way.
+    pub fn toggle(&mut self, now: u64) {
+        match self.running_since {
+            Some(t0) => {
+                self.accumulated += now.saturating_sub(t0);
+                self.running_since = None;
+            }
+            None => self.running_since = Some(now),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Add a reminder `minutes` from now. Dropped silently once `MAX_REMINDERS` are already pending.
+pub fn add_reminder(list: &mut Vec<u64>, now: u64, minutes: u32) {
+    if list.len() < MAX_REMINDERS {
+        list.push(now + minutes as u64 * MIN_MS);
+        list.sort_unstable();
+    }
+}
+
+/// Remove and return every reminder that is due by `now` (soonest first).
+pub fn take_due(list: &mut Vec<u64>, now: u64) -> Vec<u64> {
+    let split = list.partition_point(|&t| t <= now);
+    list.drain(..split).collect()
+}
+
+/// Milliseconds until the next reminder fires, if any are pending.
+pub fn next_reminder_wake(list: &[u64], now: u64) -> Option<u64> {
+    list.iter().min().map(|&t| t.saturating_sub(now).max(1))
+}
+
 /// "25:00", "04:07", "1:05:00".
 pub fn fmt_clock(secs: u64) -> String {
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
@@ -219,5 +277,46 @@ mod tests {
         assert_eq!(fmt_clock(247), "04:07");
         assert_eq!(fmt_clock(1500), "25:00");
         assert_eq!(fmt_clock(3905), "1:05:05");
+    }
+
+    #[test]
+    fn stopwatch_counts_up_and_pauses() {
+        let mut sw = Stopwatch::default();
+        assert!(!sw.running());
+        sw.toggle(1000);
+        assert!(sw.running());
+        assert_eq!(sw.elapsed(5000), 4000);
+        sw.toggle(5000); // pause
+        assert!(!sw.running());
+        assert_eq!(sw.elapsed(9000), 4000); // time stands still while paused
+        sw.toggle(9000); // resume
+        assert_eq!(sw.elapsed(10_000), 5000);
+        sw.reset();
+        assert!(!sw.running());
+        assert_eq!(sw.elapsed(10_000), 0);
+    }
+
+    #[test]
+    fn reminders_add_sorted_cap_and_fire_once() {
+        let mut list = Vec::new();
+        add_reminder(&mut list, 0, 30);
+        add_reminder(&mut list, 0, 10);
+        add_reminder(&mut list, 0, 60);
+        assert_eq!(list, [10 * MIN_MS, 30 * MIN_MS, 60 * MIN_MS]); // sorted soonest first
+        assert_eq!(next_reminder_wake(&list, 0), Some(10 * MIN_MS));
+        assert!(take_due(&mut list, 5 * MIN_MS).is_empty());
+        let due = take_due(&mut list, 31 * MIN_MS);
+        assert_eq!(due, [10 * MIN_MS, 30 * MIN_MS]);
+        assert_eq!(list, [60 * MIN_MS]);
+        assert!(take_due(&mut list, 31 * MIN_MS).is_empty()); // already removed, no re-fire
+    }
+
+    #[test]
+    fn reminders_cap_at_max() {
+        let mut list = Vec::new();
+        for i in 0..MAX_REMINDERS + 3 {
+            add_reminder(&mut list, 0, 1 + i as u32);
+        }
+        assert_eq!(list.len(), MAX_REMINDERS);
     }
 }
