@@ -1,6 +1,6 @@
 [package]
 name = "notch-island"
-version = "0.1.0"
+version = "0.3.2"
 edition = "2021"
 description = "A dynamic-island style notch overlay for Windows. Native Win32 + software rendering, no webview."
 license = "MIT"
