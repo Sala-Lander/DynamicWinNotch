@@ -297,11 +297,24 @@ impl Worker {
     }
 
     fn read(&mut self, s: &Session, info: &mut MediaInfo, art_update: &mut Option<Option<Art>>) -> windows::core::Result<()> {
+        let pb = s.GetPlaybackInfo()?;
+        let status = pb.PlaybackStatus()?;
+        if status == PbStatus::Closed {
+            // GSMTC can keep "the current session" pointed at an app that has actually closed,
+            // still answering with that app's *last* track - show nothing rather than stale info.
+            if !self.last_key.is_empty() {
+                self.last_key.clear();
+                self.have_art = false;
+                if self.want_art {
+                    *art_update = Some(None);
+                }
+            }
+            return Ok(()); // `info` stays MediaInfo::default(): has_session == false
+        }
+
         info.has_session = true;
         info.app = friendly_app(&s.SourceAppUserModelId()?.to_string());
-
-        let pb = s.GetPlaybackInfo()?;
-        info.playing = pb.PlaybackStatus()? == PbStatus::Playing;
+        info.playing = status == PbStatus::Playing;
         if let Ok(c) = pb.Controls() {
             info.can_prev = c.IsPreviousEnabled().unwrap_or(false);
             info.can_next = c.IsNextEnabled().unwrap_or(false);
