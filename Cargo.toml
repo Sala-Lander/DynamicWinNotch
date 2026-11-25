@@ -1,0 +1,58 @@
+[package]
+name = "notch-island"
+version = "0.5.0"
+edition = "2021"
+description = "A dynamic-island style notch overlay for Windows. Native Win32 + software rendering, no webview."
+license = "MIT"
+rust-version = "1.75"
+
+[dependencies]
+# CPU rasteriser for shapes (no PNG codec, no image stack).
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+# Pure-Rust glyph rasteriser. Fonts are read from C:\Windows\Fonts at run time,
+# so nothing is embedded in the exe.
+ab_glyph = "0.2"
+# Clipboard access. `image-data` adds image get/set (arboard decodes the Windows DIB for us).
+arboard = { version = "3.4", default-features = false, features = ["image-data"] }
+# Deflate for the clipboard image history (pure Rust, tiny). Images sit compressed in RAM.
+miniz_oxide = "0.8"
+
+# The `windows` crate is used for WinRT (Global System Media Transport Controls, thumbnail
+# decoding, the toast-notification listener, Bluetooth device watcher) and the COM master-volume
+# callback. All plain Win32 calls are hand-declared in src/ffi.rs (PDH, registry, raw input too).
+# `#[implement]` (volume callback) expands to paths in `windows_core`.
+windows-core = "0.58"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Media",
+    "Media_Control",
+    "Graphics_Imaging",
+    "Storage_Streams",
+    "UI_Notifications",
+    "UI_Notifications_Management",
+    "Data_Xml_Dom",
+    # Needed for UserNotification::AppInfo() -> ApplicationModel::AppInfo (app display name).
+    "ApplicationModel",
+    # Bluetooth connect / disconnect peeks.
+    "Devices_Bluetooth",
+    "Devices_Enumeration",
+    # Volume peek: IAudioEndpointVolumeCallback (COM, implemented with #[implement]).
+    "implement",
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Com",
+]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+incremental = false
