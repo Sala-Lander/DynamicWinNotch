@@ -71,6 +71,63 @@ pub enum Dnd {
     Games,
 }
 
+/// Character of the generated (built-in) sounds. Your own `.wav` files in the sounds folder
+/// override the generated ones whatever the pack is - see `sound.rs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SoundPack {
+    /// Round sine tones.
+    Soft,
+    /// Brighter, glassy triangle tones.
+    Glass,
+    /// Chunky 8-bit square tones.
+    Retro,
+}
+
+/// Which alarm plays when the timer ends (and, once, for a reminder).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlarmTone {
+    Off,
+    Chime,
+    Beep,
+    Bell,
+}
+
+/// How often the timer alarm repeats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlarmRepeat {
+    Once,
+    Three,
+    /// Repeats for up to 30 s, or until you click / open the island.
+    Loop,
+}
+
+/// Event sounds, stored as a bit set in `Config::sound_events`.
+pub mod sev {
+    pub const NOTIFY: u8 = 1 << 0;
+    pub const POWER: u8 = 1 << 1;
+    pub const COPY: u8 = 1 << 2;
+    pub const BLUETOOTH: u8 = 1 << 3;
+    pub const ALL: u8 = NOTIFY | POWER | COPY | BLUETOOTH;
+    /// Config-file names, in display order.
+    pub const NAMES: [(&str, u8); 4] =
+        [("notify", NOTIFY), ("power", POWER), ("copy", COPY), ("bluetooth", BLUETOOTH)];
+
+    pub fn parse(v: &str) -> u8 {
+        v.split([',', ' ', ';'])
+            .filter_map(|t| NAMES.iter().find(|(n, _)| n.eq_ignore_ascii_case(t.trim())).map(|(_, b)| *b))
+            .fold(0, |a, b| a | b)
+    }
+
+    pub fn render(bits: u8) -> String {
+        let v: Vec<&str> = NAMES.iter().filter(|(_, b)| bits & b != 0).map(|(n, _)| *n).collect();
+        if v.is_empty() {
+            "none".into()
+        } else {
+            v.join(",")
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub expand_on: ExpandOn,
@@ -94,8 +151,17 @@ pub struct Config {
     pub image_budget_mb: u32,
     /// Peek when the charger is plugged / unplugged and when the battery runs low.
     pub power_alerts: bool,
-    /// Play the system notification sound when the timer ends.
-    pub timer_sound: bool,
+    /// Master switch for every sound.
+    pub sounds: bool,
+    /// Volume of the island's own sounds, 0-100.
+    pub sound_volume: u32,
+    pub sound_pack: SoundPack,
+    /// Small clicks when you use the island (tabs, buttons, settings) and open / close sounds.
+    pub ui_sounds: bool,
+    /// Which events make a sound (`sev::*` bits).
+    pub sound_events: u8,
+    pub alarm_tone: AlarmTone,
+    pub alarm_repeat: AlarmRepeat,
     /// Peek on new Windows toast notifications. Requires notification-listener access, which is
     /// commonly denied to an unpackaged .exe - see the README.
     pub notifications: bool,
@@ -140,9 +206,15 @@ impl Default for Config {
             clip_images: true,
             image_budget_mb: 64,
             power_alerts: true,
-            timer_sound: true,
-            notifications: true,
-            fullscreen_mode: FullscreenMode::GameBar,
+            sounds: true,
+            sound_volume: 60,
+            sound_pack: SoundPack::Soft,
+            ui_sounds: true,
+            sound_events: sev::ALL,
+            alarm_tone: AlarmTone::Chime,
+            alarm_repeat: AlarmRepeat::Three,
+            notifications: false,
+            fullscreen_mode: FullscreenMode::Hide,
             net_speed: true,
             game_items: gb::DEFAULT,
             ping_host: "1.1.1.1".into(),
@@ -208,7 +280,38 @@ pub fn parse(text: &str) -> Config {
             "clip_images" => c.clip_images = truthy(v),
             "image_budget_mb" => c.image_budget_mb = v.parse::<u32>().unwrap_or(c.image_budget_mb).clamp(8, 512),
             "power_alerts" => c.power_alerts = truthy(v),
-            "timer_sound" => c.timer_sound = truthy(v),
+            // Old key from before the Sounds page: "0" silences the timer alarm.
+            "timer_sound" => {
+                if !truthy(v) {
+                    c.alarm_tone = AlarmTone::Off;
+                }
+            }
+            "sounds" => c.sounds = truthy(v),
+            "sound_volume" => c.sound_volume = v.parse::<u32>().unwrap_or(c.sound_volume).min(100),
+            "sound_pack" => {
+                c.sound_pack = match v.to_ascii_lowercase().as_str() {
+                    "glass" => SoundPack::Glass,
+                    "retro" => SoundPack::Retro,
+                    _ => SoundPack::Soft,
+                }
+            }
+            "ui_sounds" => c.ui_sounds = truthy(v),
+            "sound_events" => c.sound_events = sev::parse(v),
+            "alarm_tone" => {
+                c.alarm_tone = match v.to_ascii_lowercase().as_str() {
+                    "off" | "none" | "0" => AlarmTone::Off,
+                    "beep" => AlarmTone::Beep,
+                    "bell" => AlarmTone::Bell,
+                    _ => AlarmTone::Chime,
+                }
+            }
+            "alarm_repeat" => {
+                c.alarm_repeat = match v.to_ascii_lowercase().as_str() {
+                    "once" | "1" => AlarmRepeat::Once,
+                    "loop" | "until_clicked" => AlarmRepeat::Loop,
+                    _ => AlarmRepeat::Three,
+                }
+            }
             "notifications" => c.notifications = truthy(v),
             "fullscreen_mode" => {
                 c.fullscreen_mode = if v.eq_ignore_ascii_case("gamebar") || v.eq_ignore_ascii_case("game_bar") {
@@ -243,6 +346,11 @@ pub fn parse(text: &str) -> Config {
 pub fn path() -> Option<PathBuf> {
     let base = std::env::var_os("APPDATA")?;
     Some(PathBuf::from(base).join("NotchIsland").join("config.ini"))
+}
+
+/// Folder for your own sound files: `%APPDATA%\NotchIsland\sounds`.
+pub fn sounds_dir() -> Option<PathBuf> {
+    Some(path()?.parent()?.join("sounds"))
 }
 
 pub fn load() -> Config {
@@ -307,8 +415,31 @@ auto_peek = {peek}
 # Peek when the charger is plugged in / removed and when the battery is low (1/0).
 power_alerts = {power}
 
-# Play the system sound when the timer ends (1/0).
-timer_sound = {sound}
+# ---- Sounds ------------------------------------------------------------------------------
+# Want your own sounds? Tray menu -> \"Open sounds folder\", drop a .wav in with one of these
+# names (tick, open, close, notify, power, copy, bluetooth, alarm, reminder) and choose
+# \"Reload config\". A file there always wins over the generated sound.
+
+# Master switch for every sound (1/0).
+sounds = {sounds}
+
+# Volume of the island's own sounds, 0-100.
+sound_volume = {sndvol}
+
+# Character of the generated sounds: soft | glass | retro
+sound_pack = {sndpack}
+
+# Small clicks on tabs, buttons and settings, plus open / close sounds (1/0).
+ui_sounds = {uisounds}
+
+# Events that make a sound, comma separated: notify, power, copy, bluetooth - or \"none\"
+sound_events = {sndevents}
+
+# Timer alarm: off | chime | beep | bell. A reminder plays the same tone once.
+alarm_tone = {alarmtone}
+
+# How often the timer alarm repeats: once | 3 | loop (loop = up to 30 s, or until you click the island)
+alarm_repeat = {alarmrepeat}
 
 # Skip clipboard content that password managers flag as sensitive (1/0).
 privacy_filter = {privacy}
@@ -377,7 +508,26 @@ accent = {accent}
         eq = b(c.equalizer),
         peek = b(c.auto_peek),
         power = b(c.power_alerts),
-        sound = b(c.timer_sound),
+        sounds = b(c.sounds),
+        sndvol = c.sound_volume,
+        sndpack = match c.sound_pack {
+            SoundPack::Soft => "soft",
+            SoundPack::Glass => "glass",
+            SoundPack::Retro => "retro",
+        },
+        uisounds = b(c.ui_sounds),
+        sndevents = sev::render(c.sound_events),
+        alarmtone = match c.alarm_tone {
+            AlarmTone::Off => "off",
+            AlarmTone::Chime => "chime",
+            AlarmTone::Beep => "beep",
+            AlarmTone::Bell => "bell",
+        },
+        alarmrepeat = match c.alarm_repeat {
+            AlarmRepeat::Once => "once",
+            AlarmRepeat::Three => "3",
+            AlarmRepeat::Loop => "loop",
+        },
         privacy = b(c.privacy_filter),
         hotkey = b(c.hotkey),
         hide = b(c.hide_fullscreen),
@@ -456,7 +606,13 @@ mod tests {
             clip_images: false,
             image_budget_mb: 200,
             power_alerts: false,
-            timer_sound: false,
+            sounds: false,
+            sound_volume: 35,
+            sound_pack: SoundPack::Retro,
+            ui_sounds: false,
+            sound_events: sev::POWER | sev::BLUETOOTH,
+            alarm_tone: AlarmTone::Bell,
+            alarm_repeat: AlarmRepeat::Loop,
             notifications: true,
             fullscreen_mode: FullscreenMode::GameBar,
             net_speed: false,
@@ -483,7 +639,8 @@ mod tests {
     #[test]
     fn new_keys_parse_and_clamp() {
         let c = parse("clip_images = 0\nimage_budget_mb = 1\npower_alerts = no\ntimer_sound = off\nstart_tab = timer");
-        assert!(!c.clip_images && !c.power_alerts && !c.timer_sound);
+        assert!(!c.clip_images && !c.power_alerts);
+        assert_eq!(c.alarm_tone, AlarmTone::Off); // legacy key still silences the alarm
         assert_eq!(c.image_budget_mb, 8);
         assert_eq!(c.start_tab, Tab::Timer);
         assert_eq!(parse("image_budget_mb = 99999").image_budget_mb, 512);
@@ -492,6 +649,26 @@ mod tests {
         assert_eq!(c.fullscreen_mode, FullscreenMode::GameBar);
         assert_eq!(parse("fullscreen_mode = hide").fullscreen_mode, FullscreenMode::Hide);
         assert_eq!(parse("fullscreen_mode = bogus").fullscreen_mode, FullscreenMode::Hide);
+    }
+
+    #[test]
+    fn sound_keys_parse_and_clamp() {
+        let c = parse(
+            "sounds = 0\nsound_volume = 900\nsound_pack = GLASS\nui_sounds = no\n\
+             sound_events = copy, notify\nalarm_tone = bell\nalarm_repeat = loop",
+        );
+        assert!(!c.sounds && !c.ui_sounds);
+        assert_eq!(c.sound_volume, 100);
+        assert_eq!(c.sound_pack, SoundPack::Glass);
+        assert_eq!(c.sound_events, sev::COPY | sev::NOTIFY);
+        assert_eq!(c.alarm_tone, AlarmTone::Bell);
+        assert_eq!(c.alarm_repeat, AlarmRepeat::Loop);
+        assert_eq!(parse("sound_events = none").sound_events, 0);
+        assert_eq!(parse("alarm_repeat = 3").alarm_repeat, AlarmRepeat::Three);
+        assert_eq!(parse("alarm_repeat = once").alarm_repeat, AlarmRepeat::Once);
+        assert_eq!(parse("alarm_tone = nonsense").alarm_tone, AlarmTone::Chime);
+        // an explicit alarm_tone line after the legacy key wins
+        assert_eq!(parse("timer_sound = 0\nalarm_tone = beep").alarm_tone, AlarmTone::Beep);
     }
 
     #[test]

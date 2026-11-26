@@ -203,7 +203,6 @@ pub const WM_HOTKEY: u32 = 0x0312;
 pub const WM_POWERBROADCAST: u32 = 0x0218;
 pub const PBT_APMPOWERSTATUSCHANGE: usize = 0x000A;
 pub const CF_HDROP: u32 = 15;
-pub const MB_ICONASTERISK: u32 = 0x40;
 pub const WM_SETFOCUS: u32 = 0x0007;
 pub const WM_KILLFOCUS: u32 = 0x0008;
 pub const WM_KEYDOWN: u32 = 0x0100;
@@ -319,7 +318,6 @@ extern "system" {
     pub fn OpenClipboard(hwnd: HANDLE) -> i32;
     pub fn CloseClipboard() -> i32;
     pub fn GetClipboardData(format: u32) -> HANDLE;
-    pub fn MessageBeep(kind: u32) -> i32;
     pub fn GetDpiForSystem() -> u32;
     pub fn GetDpiForWindow(hwnd: HANDLE) -> u32;
     pub fn SetProcessDpiAwarenessContext(ctx: isize) -> i32;
@@ -759,4 +757,14 @@ mod tests {
         fill_wide(&mut b, "abcdef");
         assert_eq!(b, [97, 98, 99, 0]);
     }
+}
+
+// ---- sounds (sound.rs): play a WAV straight from memory ----------------------------------
+pub const SND_ASYNC: u32 = 0x0001;
+pub const SND_NODEFAULT: u32 = 0x0002;
+pub const SND_MEMORY: u32 = 0x0004;
+
+#[link(name = "winmm")]
+extern "system" {
+    pub fn PlaySoundW(sound: *const c_void, module: HANDLE, flags: u32) -> i32;
 }

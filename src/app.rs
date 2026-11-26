@@ -9,11 +9,8 @@
 //! 4-second housekeeping tick.
 
 use crate::clip::{self, ClipCmd, ClipFlags, ClipItem};
-use crate::config::{self, gb, Config, Dnd, ExpandOn, FullscreenMode};
-use crate::ffi::{
-    MessageBeep, PostQuitMessage, MB_ICONASTERISK, VK_BACK, VK_CAPITAL, VK_ESCAPE, VK_RETURN, WM_LBUTTONUP,
-    WM_RBUTTONUP,
-};
+use crate::config::{self, gb, sev, Config, Dnd, ExpandOn, FullscreenMode};
+use crate::ffi::{PostQuitMessage, VK_BACK, VK_CAPITAL, VK_ESCAPE, VK_RETURN, WM_LBUTTONUP, WM_RBUTTONUP};
 use crate::gfx::{pixmap_from_rgba, Canvas};
 use crate::history::{Entry, History, Kind};
 use crate::layout::{
@@ -24,6 +21,7 @@ use crate::media::{self, Cmd, MediaView, Msg, Shared};
 use crate::notify;
 use crate::power::{PowerEvent, Watcher};
 use crate::settings::{self, Action};
+use crate::sound::{self, Sound, Sounds};
 use crate::spring::Spring;
 use crate::sys::{self, Sampler};
 use crate::timer::{add_reminder, next_reminder_wake, take_due, Stopwatch, Timer, REMIND_PRESETS};
@@ -87,7 +85,11 @@ pub struct App {
     cursor: (f32, f32),
     scroll_target: f32,
     sscroll_target: f32,
+    /// Settings tab: the open category (`None` = the home page with the category cards).
+    settings_cat: Option<settings::Cat>,
     flash: Option<(usize, Instant)>,
+    /// Built-in and user sounds (`sound.rs`).
+    sounds: Sounds,
 
     media: MediaView,
     media_tx: Sender<Msg>,
@@ -181,6 +183,7 @@ impl App {
         let tab = cfg.start_tab;
         let mut clip = History::new(cfg.history_size);
         clip.set_budget(cfg.image_budget_mb as usize * 1024 * 1024);
+        let sounds = Sounds::new(&cfg);
         let app = App {
             geo: layout::geo(cfg.style),
             clip,
@@ -207,7 +210,9 @@ impl App {
             cursor: (-1000.0, -1000.0),
             scroll_target: 0.0,
             sscroll_target: 0.0,
+            settings_cat: None,
             flash: None,
+            sounds,
             media: MediaView::new(),
             media_tx,
             media_shared,
@@ -376,7 +381,7 @@ impl App {
         let max_scroll = self.filtered_clip().len().saturating_sub(CLIP_VISIBLE_ROWS) as f32;
         self.scroll_target = self.scroll_target.clamp(0.0, max_scroll);
         self.scroll_s.set_target(self.scroll_target);
-        let max_s = settings::ROWS.len().saturating_sub(VISIBLE_ROWS) as f32;
+        let max_s = settings::Page::new(self.settings_cat, &self.cfg).max_scroll();
         self.sscroll_target = self.sscroll_target.clamp(0.0, max_s);
         self.sscroll_s.set_target(self.sscroll_target);
     }
@@ -440,11 +445,12 @@ impl App {
     /// What is under (x, y) on the current tab (logical window coordinates).
     fn hit_at(&self, x: f32, y: f32) -> Hit {
         let (scroll, rows) = match self.tab {
-            Tab::Settings => (self.sscroll_s.pos, settings::ROWS.len()),
+            Tab::Settings => (self.sscroll_s.pos, 0),
             Tab::Clipboard => (self.scroll_s.pos, self.filtered_clip().len()),
             _ => (self.scroll_s.pos, self.clip.len()),
         };
-        layout::hit_test(&self.geo, self.tab, x, y, scroll, rows)
+        let page = settings::Page::new(self.settings_cat, &self.cfg);
+        layout::hit_test(&self.geo, self.tab, x, y, scroll, rows, &page)
     }
 
     fn expand(&mut self) {
@@ -452,6 +458,8 @@ impl App {
             return;
         }
         self.expanded = true;
+        self.sounds.stop(); // opening the island also dismisses a ringing alarm
+        self.sounds.ui(Sound::Open, Instant::now());
         self.peek = None;
         self.hover_since = None;
         self.leave_since = None;
@@ -464,6 +472,7 @@ impl App {
 
     fn collapse(&mut self) {
         self.expanded = false;
+        self.sounds.ui(Sound::Close, Instant::now());
         self.hover = Hit::None;
         self.leave_since = None;
         self.trimmed = false;
@@ -493,6 +502,7 @@ impl App {
         }
         if t == Tab::Settings {
             self.autostart = win::autostart_enabled(); // may have been changed from the tray menu
+            self.open_settings_cat(None); // always start on the category cards
         }
         self.dirty = true;
     }
@@ -519,6 +529,24 @@ impl App {
             Dnd::On => true,
             Dnd::Games => self.game_bar || self.fs_hidden || win::fullscreen_app_active(),
         }
+    }
+
+    /// An event sound (`bit` = its chip in Settings > Sounds). Quiet events respect Do not disturb,
+    /// exactly like their peeks do.
+    fn event_sound(&mut self, bit: u8, s: Sound, quiet: bool, now: Instant) {
+        if quiet && self.dnd_active() {
+            return;
+        }
+        self.sounds.event(bit, s, now);
+    }
+
+    /// Open a Settings category (`None` = back to the cards) from the top.
+    fn open_settings_cat(&mut self, cat: Option<settings::Cat>) {
+        self.settings_cat = cat;
+        self.sscroll_target = 0.0;
+        self.sscroll_s.snap(0.0);
+        self.hover = Hit::None;
+        self.dirty = true;
     }
 
     /// AUMID of the app the current (notification) peek opens when clicked.
@@ -585,6 +613,7 @@ impl App {
             }
             let line2 = if ev.connected { "Connected" } else { "Disconnected" };
             let info = PeekInfo::new(PeekKind::Bluetooth(ev.connected), ev.name.clone(), line2.to_string());
+            self.event_sound(sev::BLUETOOTH, Sound::Bluetooth, true, now);
             self.start_peek(info, PEEK_MS, now);
             self.last_bt = Some((ev, now));
         }
@@ -687,9 +716,7 @@ impl App {
     }
 
     fn on_timer_done(&mut self, now: Instant) {
-        if self.cfg.timer_sound {
-            unsafe { MessageBeep(MB_ICONASTERISK) };
-        }
+        self.sounds.alarm(now);
         let minutes = self.timer.total_ms() / 60_000;
         let info = PeekInfo::new(PeekKind::Timer, "Timer finished".to_string(), format!("{minutes} min"));
         self.start_peek(info, TIMER_PEEK_MS, now);
@@ -697,9 +724,7 @@ impl App {
     }
 
     fn on_reminder_due(&mut self, count: usize, now: Instant) {
-        if self.cfg.timer_sound {
-            unsafe { MessageBeep(MB_ICONASTERISK) };
-        }
+        self.sounds.reminder(now);
         let line2 = if count == 1 { "Reminder".to_string() } else { format!("{count} reminders") };
         let info = PeekInfo::new(PeekKind::Timer, "Time's up".to_string(), line2);
         self.start_peek(info, TIMER_PEEK_MS, now);
@@ -766,6 +791,7 @@ impl App {
             let title = if n.title.is_empty() { n.app.clone() } else { single_line(&n.title, 60) };
             let mut info = PeekInfo::new(PeekKind::Notification, title, line2);
             info.open = Some(n.aumid).filter(|a| !a.is_empty());
+            self.event_sound(sev::NOTIFY, Sound::Notify, true, now);
             self.start_peek(info, PEEK_MS, now);
         }
     }
@@ -968,6 +994,7 @@ impl App {
     }
 
     fn on_down(&mut self, btn: Btn, x: f32, y: f32, now: Instant) {
+        self.sounds.stop(); // any click on the island silences a ringing alarm
         if !self.expanded && btn == Btn::Left && self.hot_rect().contains(x, y) {
             if let Some(aumid) = self.peek_link().map(str::to_string) {
                 win::open_app(&aumid);
@@ -994,6 +1021,10 @@ impl App {
         // released outside the window cannot leave it stuck.
         self.press_s.set_target(1.0);
         self.press_until = Some(now + Duration::from_millis(110));
+        // Click sound. Settings controls and the search box make their own (or no) sound.
+        if btn == Btn::Left && !matches!(hit, Hit::Set(..) | Hit::Seek(_) | Hit::Search) {
+            self.sounds.ui(Sound::Tick, now);
+        }
 
         match (btn, hit) {
             (Btn::Left, Hit::Tab(i)) => self.set_tab(Tab::from_index(i)),
@@ -1036,6 +1067,8 @@ impl App {
                 }
             }
             (Btn::Left, Hit::Set(row, sub)) => self.on_setting(row, sub as usize, now),
+            (Btn::Left, Hit::Cat(i)) => self.open_settings_cat(Some(settings::Cat::from_index(i as usize))),
+            (Btn::Left, Hit::Back) => self.open_settings_cat(None),
             (Btn::Left, Hit::Preset(i)) => match self.timer_mode {
                 TimerMode::Countdown => {
                     self.timer.start_preset(TIMER_PRESETS[i.min(TIMER_PRESETS.len() - 1)], self.clock_ms(now));
@@ -1106,7 +1139,7 @@ impl App {
             let max = self.filtered_clip().len().saturating_sub(CLIP_VISIBLE_ROWS) as f32;
             self.scroll_target = (self.scroll_target - notches).clamp(0.0, max);
         } else if self.tab == Tab::Settings {
-            let max = settings::ROWS.len().saturating_sub(VISIBLE_ROWS) as f32;
+            let max = settings::Page::new(self.settings_cat, &self.cfg).max_scroll();
             self.sscroll_target = (self.sscroll_target - notches).clamp(0.0, max);
         } else if self.tab == Tab::Timer && self.timer_mode == TimerMode::Countdown {
             let now = Instant::now();
@@ -1159,10 +1192,13 @@ impl App {
                 ClipItem::Image(img) => self.clip.push_image(img),
             };
             if changed {
-                if self.cfg.auto_peek && !seeding {
-                    if let Some(e) = self.clip.newest() {
-                        let info = peek_for_entry(e);
-                        self.start_peek(info, PEEK_MS, now);
+                if !seeding {
+                    self.event_sound(sev::COPY, Sound::Copy, true, now);
+                    if self.cfg.auto_peek {
+                        if let Some(e) = self.clip.newest() {
+                            let info = peek_for_entry(e);
+                            self.start_peek(info, PEEK_MS, now);
+                        }
                     }
                 }
                 self.dirty = true;
@@ -1184,20 +1220,24 @@ impl App {
 
     // ------------------------------------------------------------- settings
     fn on_setting(&mut self, row: usize, sub: usize, now: Instant) {
-        let Some(r) = settings::ROWS.get(row) else {
+        // `row` is a position on the page that is open, not an index into all rows.
+        let page = settings::Page::new(self.settings_cat, &self.cfg);
+        let Some(&id) = page.rows.as_slice().get(row) else {
             return;
         };
         let old = self.cfg.clone();
-        match settings::apply(&mut self.cfg, self.autostart, r.id, sub) {
+        match settings::apply(&mut self.cfg, self.autostart, id, sub) {
             Action::Nothing => {}
             Action::Changed => {
-                self.apply_config(&old);
+                self.apply_config(&old); // also rebuilds the sounds when a sound setting changed
                 config::save(&self.cfg);
                 self.saved_at = Some(now);
+                self.setting_sound(id, sub, now);
             }
             Action::Autostart(on) => {
                 win::set_autostart(on);
                 self.autostart = win::autostart_enabled();
+                self.sounds.ui(Sound::Tick, now);
             }
             Action::OpenConfig => {
                 config::save(&self.cfg); // the file then shows exactly what the UI shows
@@ -1205,9 +1245,30 @@ impl App {
                     win::open_in_editor(&p);
                 }
             }
+            Action::OpenSounds => {
+                if let Some(p) = sound::prepare_folder() {
+                    win::open_in_editor(&p);
+                }
+            }
             Action::Reload => self.reload_config(),
         }
         self.dirty = true;
+    }
+
+    /// Audible feedback for a changed setting: settings that are about sound let you hear the
+    /// result, everything else gives the normal click.
+    fn setting_sound(&mut self, id: settings::Id, sub: usize, now: Instant) {
+        use settings::Id;
+        match id {
+            Id::SoundsOn | Id::SoundVolume | Id::SoundPack => self.sounds.preview(Sound::Notify, now),
+            Id::AlarmTone => self.sounds.preview_alarm(now),
+            Id::EventSounds => {
+                if let Some(&(bit, s)) = sound::EVENT_SOUNDS.get(sub) {
+                    self.sounds.event(bit, s, now); // plays only when the chip is now on
+                }
+            }
+            _ => self.sounds.ui(Sound::Tick, now),
+        }
     }
 
     /// Make the running app match `self.cfg`; `old` is what was in effect before.
@@ -1234,6 +1295,9 @@ impl App {
             } else {
                 let _ = self.media_tx.send(Msg::Refresh);
             }
+        }
+        if sound::config_differs(old, c) {
+            self.sounds.rebuild(c);
         }
         if c.notifications != old.notifications {
             let _ = self.notify_tx.send(notify::Msg::Enable(c.notifications));
@@ -1269,6 +1333,7 @@ impl App {
         };
         let mut info = PeekInfo::new(PeekKind::Power(icon), l1, l2);
         info.level = lvl;
+        self.event_sound(sev::POWER, Sound::Power, false, now);
         self.start_peek(info, PEEK_MS, now);
         if self.expanded && self.tab == Tab::System {
             self.sample_now(); // refresh the battery ring right away
@@ -1284,6 +1349,7 @@ impl App {
             (0, "", false),
             (3, "Reload config", false),
             (4, "Open config file", false),
+            (7, "Open sounds folder", false),
             (0, "", false),
             (5, "Quit", false),
         ];
@@ -1296,6 +1362,11 @@ impl App {
             3 => self.reload_config(),
             4 => {
                 if let Some(p) = config::ensure_template() {
+                    win::open_in_editor(&p);
+                }
+            }
+            7 => {
+                if let Some(p) = sound::prepare_folder() {
                     win::open_in_editor(&p);
                 }
             }
@@ -1313,6 +1384,7 @@ impl App {
     fn reload_config(&mut self) {
         let old = std::mem::replace(&mut self.cfg, config::load());
         self.apply_config(&old);
+        self.sounds.rebuild(&self.cfg); // also picks up .wav files added or removed meanwhile
         self.win.register_hotkey(self.cfg.hotkey);
     }
 
@@ -1343,6 +1415,7 @@ impl App {
             clip: &self.clip,
             scroll: self.scroll_s.pos,
             sscroll: self.sscroll_s.pos,
+            scat: self.settings_cat,
             autostart: self.autostart,
             saved: self.saved_at.map_or(0.0, |t0| {
                 let e = now.saturating_duration_since(t0).as_secs_f32();

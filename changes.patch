@@ -1,0 +1,2523 @@
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' orig/README.md src/README.md
+--- a/README.md	2026-11-25 21:38:03.384730855 +0100
++++ b/README.md	2026-11-26 07:10:56.564731907 +0100
+@@ -10,7 +10,7 @@
+ | **Clipboard** | History of everything you copy: **text, links** (host highlighted), **colours** (`#RRGGBB`, `rgb(...)` get a swatch), **files** (Explorer copies) and **images** (thumbnail in the row; screenshots, "Copy image" in a browser, ...). A **search box** at the top filters the list live (case-insensitive, matches the preview text). Click a row to copy it back (images go back as images), right-click to pin, middle-click to delete, wheel to scroll, "Clear" to wipe unpinned items. |
+ | **System** | CPU, GPU, memory and battery as live ring gauges, plus thread count, used/total RAM, charge state and live **network throughput** (down / up, auto-scaled B·s⁻¹ / KB·s⁻¹ / MB·s⁻¹; switchable with *Live network speed*). |
+ | **Timer** | Three modes, cycled with the header's mode label (where "Clear" sits on the Clipboard tab): **Countdown** (presets, start / pause / reset, +-1 min, wheel to adjust; peeks and sounds at zero), **Stopwatch** (start / pause / reset, counts up), **Reminders** (quick-add +10 / +30 / +60 min, up to 5 pending at once, "Clear all"; each one peeks and sounds when it comes due). |
+-| **Settings** | Every option in the island itself: expand mode, style, accent colour swatches, toggles (album art, equalizer, peeks, battery alerts, timer sound, clipboard images, notification peeks, volume / brightness / Caps-Num Lock / Bluetooth peeks, mic & camera indicator, password-manager filter, full-screen hiding, start with Windows), do not disturb (off / on / games), a full-screen behaviour switch (hide / game bar), game-bar readout chips (FPS, 1 %, 0.1 %, frame time / CPU, GPU, RAM, ping, network), live network speed, steppers (history size, hover delay), frame rate. Changes apply immediately and are saved to `config.ini`. |
++| **Settings** | Every option in the island itself, in six categories: a home page of cards (each with a live summary) opens a category page, **Back** returns. *Look & feel* (style, accent colour, album art, equalizer), *General* (expand mode, hover delay, frame rate, start with Windows, config file), *Peeks* (every peek switch in one grid), *Sounds* (see below), *Focus & games* (do not disturb, full-screen hiding and behaviour, game-bar readout chips) and *Data* (clipboard images, password-manager filter, history size, live network speed). Changes apply immediately and are saved to `config.ini`. |
+ 
+ Native Win32 layered window + `tiny-skia` software rendering. No webview, no GPU framework,
+ no Electron/Tauri runtime, no polling loop.
+@@ -32,7 +32,7 @@
+ 
+ * **Hover** the pill (or **click** it, see `expand_on`) to expand; move away to collapse.
+ * **Pin** with the thumbtack in the island, the tray icon (left-click) or **Ctrl+Alt+N**.
+-* **Tray icon** (right-click): pin, open settings, start with Windows, reload config, open config, quit.
++* **Tray icon** (right-click): pin, open settings, start with Windows, reload config, open config, open sounds folder, quit.
+ * The pill briefly widens (peek) on a track change (cover + title), on every new clipboard item
+   (thumbnail for images, swatch for colours), when the timer/stopwatch-adjacent reminders fire, for
+   battery events (charger plugged in / removed, battery low (20 %) and critical (10 %), fully
+@@ -58,15 +58,43 @@
+ (tray -> *Open config file*, then *Reload config*). Keys: `expand_on`, `style` (`notch` = fused to the screen edge with concave ears,
+ `island` = floating pill), `start_tab`, `hover_delay_ms`, `collapse_delay_ms`, `history_size`,
+ `clip_images`, `image_budget_mb` (compressed-image memory budget, 8-512), `album_art`, `equalizer`,
+-`auto_peek`, `power_alerts`, `timer_sound`, `privacy_filter`, `hotkey`, `hide_fullscreen`, `fps_cap`,
++`auto_peek`, `power_alerts`, `privacy_filter`, `hotkey`, `hide_fullscreen`, `fps_cap`,
+ `notifications` (toast-notification peeks - see **Limitations**), `volume_peek`, `brightness_peek`,
+ `lock_peek`, `bt_peek`, `privacy_dot` (all 1/0), `dnd` (`off` / `on` / `games`), `fullscreen_mode`
+ (`hide` or `gamebar`, what `hide_fullscreen` switches to when triggered), `gamebar_items`
+ (comma list of `fps,low1,low01,frametime,cpu,gpu,ram,ping,net`, or `none`), `ping_host` (default
+-`1.1.1.1`), `net_speed` (live network throughput, 1/0), `accent` (`auto` = from the
++`1.1.1.1`), `net_speed` (live network throughput, 1/0), the sound keys (see **Sounds**), `accent` (`auto` = from the
+ cover art, or `#RRGGBB`). `start_tab` also accepts `timer` and `settings`.
+ Existing config files keep working; missing keys use their defaults.
+ 
++## Sounds
++
++The island can click, chime and ring. Everything lives in *Settings > Sounds* (and `config.ini`):
++
++| Setting (`config.ini` key) | Default | What it does |
++|---|---|---|
++| Sounds (`sounds`) | On | Master switch. While off nothing is generated or held in memory. |
++| Volume (`sound_volume`) | 60 | 0-100, also applies to your own `.wav` files. |
++| Sound pack (`sound_pack`) | Soft | `soft` (sine), `glass` (triangle) or `retro` (square) - the character of the built-in sounds. |
++| UI sounds (`ui_sounds`) | On | A small click on tabs, buttons and settings, plus open / close sounds. |
++| Event sounds (`sound_events`) | all | Comma list of `notify`, `power`, `copy`, `bluetooth` (or `none`). Notification, copy and Bluetooth sounds follow *Do not disturb*; battery sounds always play. |
++| Timer alarm (`alarm_tone`) | Chime | `off`, `chime`, `beep` or `bell`. A reminder plays the same tone once. |
++| Alarm repeat (`alarm_repeat`) | 3x | `once`, `3` or `loop` (up to 30 s). Clicking or opening the island silences a ringing alarm. |
++
++**Your own sounds.** Settings > Sounds > *Own sounds* > **Folder** (or tray > *Open sounds folder*) opens
++`%APPDATA%\NotchIsland\sounds`. Drop a `.wav` in there named after the sound and press **Reload**
++(or tray > *Reload config*):
++
++`tick.wav` `open.wav` `close.wav` `notify.wav` `power.wav` `copy.wav` `bluetooth.wav` `alarm.wav` `reminder.wav`
++
++A file there always wins over the generated sound; delete it to go back. Format: 8 or 16 bit PCM WAV,
++mono or stereo, up to 4 MB. `alarm.wav` is repeated automatically per *Alarm repeat*, and `reminder.wav`
++is optional (a reminder falls back to `alarm.wav`, then to the chosen tone).
++
++**Tweaking the built-in tones.** Each generated sound is a short list of notes (`hz`, start, length,
++loudness) at the top of `src/sound.rs`; edit the numbers or add notes. The three packs are defined in
++`pack_style`. No audio files are embedded, so the exe stays a single file.
++
+ ## How it stays light
+ 
+ * **Zero idle cost.** A collapsed island with nothing playing does nothing: hover is detected with
+@@ -101,7 +129,8 @@
+ src/app.rs      state machine: hover/click/pin, springs, workers, render scheduling
+ src/ui.rs       all drawing (pill, compact/peek content, five pages)
+ src/layout.rs   geometry + hit-testing (pure, unit-tested)
+-src/settings.rs Settings tab as data: rows, controls, what a click does to the config (pure, unit-tested)
++src/settings.rs Settings tab as data: categories, rows, controls, what a click does to the config (pure, unit-tested)
++src/sound.rs    generated tones + your own .wav overrides, played with winmm (synthesis and WAV handling pure, unit-tested)
+ src/timer.rs    countdown state machine (pure, unit-tested)
+ src/power.rs    charger / low-battery event detection (pure, unit-tested)
+ src/detect.rs   link and colour recognition for clipboard text (pure, unit-tested)
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' orig/src/app.rs src/src/app.rs
+--- a/src/app.rs	2026-11-25 21:38:03.385126607 +0100
++++ b/src/app.rs	2026-11-26 07:11:21.586607275 +0100
+@@ -9,11 +9,8 @@
+ //! 4-second housekeeping tick.
+ 
+ use crate::clip::{self, ClipCmd, ClipFlags, ClipItem};
+-use crate::config::{self, gb, Config, Dnd, ExpandOn, FullscreenMode};
+-use crate::ffi::{
+-    MessageBeep, PostQuitMessage, MB_ICONASTERISK, VK_BACK, VK_CAPITAL, VK_ESCAPE, VK_RETURN, WM_LBUTTONUP,
+-    WM_RBUTTONUP,
+-};
++use crate::config::{self, gb, sev, Config, Dnd, ExpandOn, FullscreenMode};
++use crate::ffi::{PostQuitMessage, VK_BACK, VK_CAPITAL, VK_ESCAPE, VK_RETURN, WM_LBUTTONUP, WM_RBUTTONUP};
+ use crate::gfx::{pixmap_from_rgba, Canvas};
+ use crate::history::{Entry, History, Kind};
+ use crate::layout::{
+@@ -24,6 +21,7 @@
+ use crate::notify;
+ use crate::power::{PowerEvent, Watcher};
+ use crate::settings::{self, Action};
++use crate::sound::{self, Sound, Sounds};
+ use crate::spring::Spring;
+ use crate::sys::{self, Sampler};
+ use crate::timer::{add_reminder, next_reminder_wake, take_due, Stopwatch, Timer, REMIND_PRESETS};
+@@ -87,7 +85,11 @@
+     cursor: (f32, f32),
+     scroll_target: f32,
+     sscroll_target: f32,
++    /// Settings tab: the open category (`None` = the home page with the category cards).
++    settings_cat: Option<settings::Cat>,
+     flash: Option<(usize, Instant)>,
++    /// Built-in and user sounds (`sound.rs`).
++    sounds: Sounds,
+ 
+     media: MediaView,
+     media_tx: Sender<Msg>,
+@@ -181,6 +183,7 @@
+         let tab = cfg.start_tab;
+         let mut clip = History::new(cfg.history_size);
+         clip.set_budget(cfg.image_budget_mb as usize * 1024 * 1024);
++        let sounds = Sounds::new(&cfg);
+         let app = App {
+             geo: layout::geo(cfg.style),
+             clip,
+@@ -207,7 +210,9 @@
+             cursor: (-1000.0, -1000.0),
+             scroll_target: 0.0,
+             sscroll_target: 0.0,
++            settings_cat: None,
+             flash: None,
++            sounds,
+             media: MediaView::new(),
+             media_tx,
+             media_shared,
+@@ -376,7 +381,7 @@
+         let max_scroll = self.filtered_clip().len().saturating_sub(CLIP_VISIBLE_ROWS) as f32;
+         self.scroll_target = self.scroll_target.clamp(0.0, max_scroll);
+         self.scroll_s.set_target(self.scroll_target);
+-        let max_s = settings::ROWS.len().saturating_sub(VISIBLE_ROWS) as f32;
++        let max_s = settings::Page::new(self.settings_cat, &self.cfg).max_scroll();
+         self.sscroll_target = self.sscroll_target.clamp(0.0, max_s);
+         self.sscroll_s.set_target(self.sscroll_target);
+     }
+@@ -440,11 +445,12 @@
+     /// What is under (x, y) on the current tab (logical window coordinates).
+     fn hit_at(&self, x: f32, y: f32) -> Hit {
+         let (scroll, rows) = match self.tab {
+-            Tab::Settings => (self.sscroll_s.pos, settings::ROWS.len()),
++            Tab::Settings => (self.sscroll_s.pos, 0),
+             Tab::Clipboard => (self.scroll_s.pos, self.filtered_clip().len()),
+             _ => (self.scroll_s.pos, self.clip.len()),
+         };
+-        layout::hit_test(&self.geo, self.tab, x, y, scroll, rows)
++        let page = settings::Page::new(self.settings_cat, &self.cfg);
++        layout::hit_test(&self.geo, self.tab, x, y, scroll, rows, &page)
+     }
+ 
+     fn expand(&mut self) {
+@@ -452,6 +458,8 @@
+             return;
+         }
+         self.expanded = true;
++        self.sounds.stop(); // opening the island also dismisses a ringing alarm
++        self.sounds.ui(Sound::Open, Instant::now());
+         self.peek = None;
+         self.hover_since = None;
+         self.leave_since = None;
+@@ -464,6 +472,7 @@
+ 
+     fn collapse(&mut self) {
+         self.expanded = false;
++        self.sounds.ui(Sound::Close, Instant::now());
+         self.hover = Hit::None;
+         self.leave_since = None;
+         self.trimmed = false;
+@@ -493,6 +502,7 @@
+         }
+         if t == Tab::Settings {
+             self.autostart = win::autostart_enabled(); // may have been changed from the tray menu
++            self.open_settings_cat(None); // always start on the category cards
+         }
+         self.dirty = true;
+     }
+@@ -521,6 +531,24 @@
+         }
+     }
+ 
++    /// An event sound (`bit` = its chip in Settings > Sounds). Quiet events respect Do not disturb,
++    /// exactly like their peeks do.
++    fn event_sound(&mut self, bit: u8, s: Sound, quiet: bool, now: Instant) {
++        if quiet && self.dnd_active() {
++            return;
++        }
++        self.sounds.event(bit, s, now);
++    }
++
++    /// Open a Settings category (`None` = back to the cards) from the top.
++    fn open_settings_cat(&mut self, cat: Option<settings::Cat>) {
++        self.settings_cat = cat;
++        self.sscroll_target = 0.0;
++        self.sscroll_s.snap(0.0);
++        self.hover = Hit::None;
++        self.dirty = true;
++    }
++
+     /// AUMID of the app the current (notification) peek opens when clicked.
+     fn peek_link(&self) -> Option<&str> {
+         self.peek.as_ref().and_then(|(p, _)| p.open.as_deref())
+@@ -585,6 +613,7 @@
+             }
+             let line2 = if ev.connected { "Connected" } else { "Disconnected" };
+             let info = PeekInfo::new(PeekKind::Bluetooth(ev.connected), ev.name.clone(), line2.to_string());
++            self.event_sound(sev::BLUETOOTH, Sound::Bluetooth, true, now);
+             self.start_peek(info, PEEK_MS, now);
+             self.last_bt = Some((ev, now));
+         }
+@@ -687,9 +716,7 @@
+     }
+ 
+     fn on_timer_done(&mut self, now: Instant) {
+-        if self.cfg.timer_sound {
+-            unsafe { MessageBeep(MB_ICONASTERISK) };
+-        }
++        self.sounds.alarm(now);
+         let minutes = self.timer.total_ms() / 60_000;
+         let info = PeekInfo::new(PeekKind::Timer, "Timer finished".to_string(), format!("{minutes} min"));
+         self.start_peek(info, TIMER_PEEK_MS, now);
+@@ -697,9 +724,7 @@
+     }
+ 
+     fn on_reminder_due(&mut self, count: usize, now: Instant) {
+-        if self.cfg.timer_sound {
+-            unsafe { MessageBeep(MB_ICONASTERISK) };
+-        }
++        self.sounds.reminder(now);
+         let line2 = if count == 1 { "Reminder".to_string() } else { format!("{count} reminders") };
+         let info = PeekInfo::new(PeekKind::Timer, "Time's up".to_string(), line2);
+         self.start_peek(info, TIMER_PEEK_MS, now);
+@@ -766,6 +791,7 @@
+             let title = if n.title.is_empty() { n.app.clone() } else { single_line(&n.title, 60) };
+             let mut info = PeekInfo::new(PeekKind::Notification, title, line2);
+             info.open = Some(n.aumid).filter(|a| !a.is_empty());
++            self.event_sound(sev::NOTIFY, Sound::Notify, true, now);
+             self.start_peek(info, PEEK_MS, now);
+         }
+     }
+@@ -968,6 +994,7 @@
+     }
+ 
+     fn on_down(&mut self, btn: Btn, x: f32, y: f32, now: Instant) {
++        self.sounds.stop(); // any click on the island silences a ringing alarm
+         if !self.expanded && btn == Btn::Left && self.hot_rect().contains(x, y) {
+             if let Some(aumid) = self.peek_link().map(str::to_string) {
+                 win::open_app(&aumid);
+@@ -994,6 +1021,10 @@
+         // released outside the window cannot leave it stuck.
+         self.press_s.set_target(1.0);
+         self.press_until = Some(now + Duration::from_millis(110));
++        // Click sound. Settings controls and the search box make their own (or no) sound.
++        if btn == Btn::Left && !matches!(hit, Hit::Set(..) | Hit::Seek(_) | Hit::Search) {
++            self.sounds.ui(Sound::Tick, now);
++        }
+ 
+         match (btn, hit) {
+             (Btn::Left, Hit::Tab(i)) => self.set_tab(Tab::from_index(i)),
+@@ -1036,6 +1067,8 @@
+                 }
+             }
+             (Btn::Left, Hit::Set(row, sub)) => self.on_setting(row, sub as usize, now),
++            (Btn::Left, Hit::Cat(i)) => self.open_settings_cat(Some(settings::Cat::from_index(i as usize))),
++            (Btn::Left, Hit::Back) => self.open_settings_cat(None),
+             (Btn::Left, Hit::Preset(i)) => match self.timer_mode {
+                 TimerMode::Countdown => {
+                     self.timer.start_preset(TIMER_PRESETS[i.min(TIMER_PRESETS.len() - 1)], self.clock_ms(now));
+@@ -1106,7 +1139,7 @@
+             let max = self.filtered_clip().len().saturating_sub(CLIP_VISIBLE_ROWS) as f32;
+             self.scroll_target = (self.scroll_target - notches).clamp(0.0, max);
+         } else if self.tab == Tab::Settings {
+-            let max = settings::ROWS.len().saturating_sub(VISIBLE_ROWS) as f32;
++            let max = settings::Page::new(self.settings_cat, &self.cfg).max_scroll();
+             self.sscroll_target = (self.sscroll_target - notches).clamp(0.0, max);
+         } else if self.tab == Tab::Timer && self.timer_mode == TimerMode::Countdown {
+             let now = Instant::now();
+@@ -1159,10 +1192,13 @@
+                 ClipItem::Image(img) => self.clip.push_image(img),
+             };
+             if changed {
+-                if self.cfg.auto_peek && !seeding {
+-                    if let Some(e) = self.clip.newest() {
+-                        let info = peek_for_entry(e);
+-                        self.start_peek(info, PEEK_MS, now);
++                if !seeding {
++                    self.event_sound(sev::COPY, Sound::Copy, true, now);
++                    if self.cfg.auto_peek {
++                        if let Some(e) = self.clip.newest() {
++                            let info = peek_for_entry(e);
++                            self.start_peek(info, PEEK_MS, now);
++                        }
+                     }
+                 }
+                 self.dirty = true;
+@@ -1184,20 +1220,24 @@
+ 
+     // ------------------------------------------------------------- settings
+     fn on_setting(&mut self, row: usize, sub: usize, now: Instant) {
+-        let Some(r) = settings::ROWS.get(row) else {
++        // `row` is a position on the page that is open, not an index into all rows.
++        let page = settings::Page::new(self.settings_cat, &self.cfg);
++        let Some(&id) = page.rows.as_slice().get(row) else {
+             return;
+         };
+         let old = self.cfg.clone();
+-        match settings::apply(&mut self.cfg, self.autostart, r.id, sub) {
++        match settings::apply(&mut self.cfg, self.autostart, id, sub) {
+             Action::Nothing => {}
+             Action::Changed => {
+-                self.apply_config(&old);
++                self.apply_config(&old); // also rebuilds the sounds when a sound setting changed
+                 config::save(&self.cfg);
+                 self.saved_at = Some(now);
++                self.setting_sound(id, sub, now);
+             }
+             Action::Autostart(on) => {
+                 win::set_autostart(on);
+                 self.autostart = win::autostart_enabled();
++                self.sounds.ui(Sound::Tick, now);
+             }
+             Action::OpenConfig => {
+                 config::save(&self.cfg); // the file then shows exactly what the UI shows
+@@ -1205,11 +1245,32 @@
+                     win::open_in_editor(&p);
+                 }
+             }
++            Action::OpenSounds => {
++                if let Some(p) = sound::prepare_folder() {
++                    win::open_in_editor(&p);
++                }
++            }
+             Action::Reload => self.reload_config(),
+         }
+         self.dirty = true;
+     }
+ 
++    /// Audible feedback for a changed setting: settings that are about sound let you hear the
++    /// result, everything else gives the normal click.
++    fn setting_sound(&mut self, id: settings::Id, sub: usize, now: Instant) {
++        use settings::Id;
++        match id {
++            Id::SoundsOn | Id::SoundVolume | Id::SoundPack => self.sounds.preview(Sound::Notify, now),
++            Id::AlarmTone => self.sounds.preview_alarm(now),
++            Id::EventSounds => {
++                if let Some(&(bit, s)) = sound::EVENT_SOUNDS.get(sub) {
++                    self.sounds.event(bit, s, now); // plays only when the chip is now on
++                }
++            }
++            _ => self.sounds.ui(Sound::Tick, now),
++        }
++    }
++
+     /// Make the running app match `self.cfg`; `old` is what was in effect before.
+     fn apply_config(&mut self, old: &Config) {
+         let c = &self.cfg;
+@@ -1235,6 +1296,9 @@
+                 let _ = self.media_tx.send(Msg::Refresh);
+             }
+         }
++        if sound::config_differs(old, c) {
++            self.sounds.rebuild(c);
++        }
+         if c.notifications != old.notifications {
+             let _ = self.notify_tx.send(notify::Msg::Enable(c.notifications));
+             self.notify_hint_shown = false;
+@@ -1269,6 +1333,7 @@
+         };
+         let mut info = PeekInfo::new(PeekKind::Power(icon), l1, l2);
+         info.level = lvl;
++        self.event_sound(sev::POWER, Sound::Power, false, now);
+         self.start_peek(info, PEEK_MS, now);
+         if self.expanded && self.tab == Tab::System {
+             self.sample_now(); // refresh the battery ring right away
+@@ -1284,6 +1349,7 @@
+             (0, "", false),
+             (3, "Reload config", false),
+             (4, "Open config file", false),
++            (7, "Open sounds folder", false),
+             (0, "", false),
+             (5, "Quit", false),
+         ];
+@@ -1299,6 +1365,11 @@
+                     win::open_in_editor(&p);
+                 }
+             }
++            7 => {
++                if let Some(p) = sound::prepare_folder() {
++                    win::open_in_editor(&p);
++                }
++            }
+             5 => unsafe { PostQuitMessage(0) },
+             6 => {
+                 self.set_tab(Tab::Settings);
+@@ -1313,6 +1384,7 @@
+     fn reload_config(&mut self) {
+         let old = std::mem::replace(&mut self.cfg, config::load());
+         self.apply_config(&old);
++        self.sounds.rebuild(&self.cfg); // also picks up .wav files added or removed meanwhile
+         self.win.register_hotkey(self.cfg.hotkey);
+     }
+ 
+@@ -1343,6 +1415,7 @@
+             clip: &self.clip,
+             scroll: self.scroll_s.pos,
+             sscroll: self.sscroll_s.pos,
++            scat: self.settings_cat,
+             autostart: self.autostart,
+             saved: self.saved_at.map_or(0.0, |t0| {
+                 let e = now.saturating_duration_since(t0).as_secs_f32();
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' orig/src/config.rs src/src/config.rs
+--- a/src/config.rs	2026-11-25 21:38:03.385438408 +0100
++++ b/src/config.rs	2026-11-25 21:38:35.211895702 +0100
+@@ -71,6 +71,63 @@
+     Games,
+ }
+ 
++/// Character of the generated (built-in) sounds. Your own `.wav` files in the sounds folder
++/// override the generated ones whatever the pack is - see `sound.rs`.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum SoundPack {
++    /// Round sine tones.
++    Soft,
++    /// Brighter, glassy triangle tones.
++    Glass,
++    /// Chunky 8-bit square tones.
++    Retro,
++}
++
++/// Which alarm plays when the timer ends (and, once, for a reminder).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum AlarmTone {
++    Off,
++    Chime,
++    Beep,
++    Bell,
++}
++
++/// How often the timer alarm repeats.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum AlarmRepeat {
++    Once,
++    Three,
++    /// Repeats for up to 30 s, or until you click / open the island.
++    Loop,
++}
++
++/// Event sounds, stored as a bit set in `Config::sound_events`.
++pub mod sev {
++    pub const NOTIFY: u8 = 1 << 0;
++    pub const POWER: u8 = 1 << 1;
++    pub const COPY: u8 = 1 << 2;
++    pub const BLUETOOTH: u8 = 1 << 3;
++    pub const ALL: u8 = NOTIFY | POWER | COPY | BLUETOOTH;
++    /// Config-file names, in display order.
++    pub const NAMES: [(&str, u8); 4] =
++        [("notify", NOTIFY), ("power", POWER), ("copy", COPY), ("bluetooth", BLUETOOTH)];
++
++    pub fn parse(v: &str) -> u8 {
++        v.split([',', ' ', ';'])
++            .filter_map(|t| NAMES.iter().find(|(n, _)| n.eq_ignore_ascii_case(t.trim())).map(|(_, b)| *b))
++            .fold(0, |a, b| a | b)
++    }
++
++    pub fn render(bits: u8) -> String {
++        let v: Vec<&str> = NAMES.iter().filter(|(_, b)| bits & b != 0).map(|(n, _)| *n).collect();
++        if v.is_empty() {
++            "none".into()
++        } else {
++            v.join(",")
++        }
++    }
++}
++
+ #[derive(Clone, Debug, PartialEq)]
+ pub struct Config {
+     pub expand_on: ExpandOn,
+@@ -94,8 +151,17 @@
+     pub image_budget_mb: u32,
+     /// Peek when the charger is plugged / unplugged and when the battery runs low.
+     pub power_alerts: bool,
+-    /// Play the system notification sound when the timer ends.
+-    pub timer_sound: bool,
++    /// Master switch for every sound.
++    pub sounds: bool,
++    /// Volume of the island's own sounds, 0-100.
++    pub sound_volume: u32,
++    pub sound_pack: SoundPack,
++    /// Small clicks when you use the island (tabs, buttons, settings) and open / close sounds.
++    pub ui_sounds: bool,
++    /// Which events make a sound (`sev::*` bits).
++    pub sound_events: u8,
++    pub alarm_tone: AlarmTone,
++    pub alarm_repeat: AlarmRepeat,
+     /// Peek on new Windows toast notifications. Requires notification-listener access, which is
+     /// commonly denied to an unpackaged .exe - see the README.
+     pub notifications: bool,
+@@ -140,7 +206,13 @@
+             clip_images: true,
+             image_budget_mb: 64,
+             power_alerts: true,
+-            timer_sound: true,
++            sounds: true,
++            sound_volume: 60,
++            sound_pack: SoundPack::Soft,
++            ui_sounds: true,
++            sound_events: sev::ALL,
++            alarm_tone: AlarmTone::Chime,
++            alarm_repeat: AlarmRepeat::Three,
+             notifications: false,
+             fullscreen_mode: FullscreenMode::Hide,
+             net_speed: true,
+@@ -208,7 +280,38 @@
+             "clip_images" => c.clip_images = truthy(v),
+             "image_budget_mb" => c.image_budget_mb = v.parse::<u32>().unwrap_or(c.image_budget_mb).clamp(8, 512),
+             "power_alerts" => c.power_alerts = truthy(v),
+-            "timer_sound" => c.timer_sound = truthy(v),
++            // Old key from before the Sounds page: "0" silences the timer alarm.
++            "timer_sound" => {
++                if !truthy(v) {
++                    c.alarm_tone = AlarmTone::Off;
++                }
++            }
++            "sounds" => c.sounds = truthy(v),
++            "sound_volume" => c.sound_volume = v.parse::<u32>().unwrap_or(c.sound_volume).min(100),
++            "sound_pack" => {
++                c.sound_pack = match v.to_ascii_lowercase().as_str() {
++                    "glass" => SoundPack::Glass,
++                    "retro" => SoundPack::Retro,
++                    _ => SoundPack::Soft,
++                }
++            }
++            "ui_sounds" => c.ui_sounds = truthy(v),
++            "sound_events" => c.sound_events = sev::parse(v),
++            "alarm_tone" => {
++                c.alarm_tone = match v.to_ascii_lowercase().as_str() {
++                    "off" | "none" | "0" => AlarmTone::Off,
++                    "beep" => AlarmTone::Beep,
++                    "bell" => AlarmTone::Bell,
++                    _ => AlarmTone::Chime,
++                }
++            }
++            "alarm_repeat" => {
++                c.alarm_repeat = match v.to_ascii_lowercase().as_str() {
++                    "once" | "1" => AlarmRepeat::Once,
++                    "loop" | "until_clicked" => AlarmRepeat::Loop,
++                    _ => AlarmRepeat::Three,
++                }
++            }
+             "notifications" => c.notifications = truthy(v),
+             "fullscreen_mode" => {
+                 c.fullscreen_mode = if v.eq_ignore_ascii_case("gamebar") || v.eq_ignore_ascii_case("game_bar") {
+@@ -245,6 +348,11 @@
+     Some(PathBuf::from(base).join("NotchIsland").join("config.ini"))
+ }
+ 
++/// Folder for your own sound files: `%APPDATA%\NotchIsland\sounds`.
++pub fn sounds_dir() -> Option<PathBuf> {
++    Some(path()?.parent()?.join("sounds"))
++}
++
+ pub fn load() -> Config {
+     path()
+         .and_then(|p| std::fs::read_to_string(p).ok())
+@@ -307,8 +415,31 @@
+ # Peek when the charger is plugged in / removed and when the battery is low (1/0).
+ power_alerts = {power}
+ 
+-# Play the system sound when the timer ends (1/0).
+-timer_sound = {sound}
++# ---- Sounds ------------------------------------------------------------------------------
++# Want your own sounds? Tray menu -> \"Open sounds folder\", drop a .wav in with one of these
++# names (tick, open, close, notify, power, copy, bluetooth, alarm, reminder) and choose
++# \"Reload config\". A file there always wins over the generated sound.
++
++# Master switch for every sound (1/0).
++sounds = {sounds}
++
++# Volume of the island's own sounds, 0-100.
++sound_volume = {sndvol}
++
++# Character of the generated sounds: soft | glass | retro
++sound_pack = {sndpack}
++
++# Small clicks on tabs, buttons and settings, plus open / close sounds (1/0).
++ui_sounds = {uisounds}
++
++# Events that make a sound, comma separated: notify, power, copy, bluetooth - or \"none\"
++sound_events = {sndevents}
++
++# Timer alarm: off | chime | beep | bell. A reminder plays the same tone once.
++alarm_tone = {alarmtone}
++
++# How often the timer alarm repeats: once | 3 | loop (loop = up to 30 s, or until you click the island)
++alarm_repeat = {alarmrepeat}
+ 
+ # Skip clipboard content that password managers flag as sensitive (1/0).
+ privacy_filter = {privacy}
+@@ -377,7 +508,26 @@
+         eq = b(c.equalizer),
+         peek = b(c.auto_peek),
+         power = b(c.power_alerts),
+-        sound = b(c.timer_sound),
++        sounds = b(c.sounds),
++        sndvol = c.sound_volume,
++        sndpack = match c.sound_pack {
++            SoundPack::Soft => "soft",
++            SoundPack::Glass => "glass",
++            SoundPack::Retro => "retro",
++        },
++        uisounds = b(c.ui_sounds),
++        sndevents = sev::render(c.sound_events),
++        alarmtone = match c.alarm_tone {
++            AlarmTone::Off => "off",
++            AlarmTone::Chime => "chime",
++            AlarmTone::Beep => "beep",
++            AlarmTone::Bell => "bell",
++        },
++        alarmrepeat = match c.alarm_repeat {
++            AlarmRepeat::Once => "once",
++            AlarmRepeat::Three => "3",
++            AlarmRepeat::Loop => "loop",
++        },
+         privacy = b(c.privacy_filter),
+         hotkey = b(c.hotkey),
+         hide = b(c.hide_fullscreen),
+@@ -456,7 +606,13 @@
+             clip_images: false,
+             image_budget_mb: 200,
+             power_alerts: false,
+-            timer_sound: false,
++            sounds: false,
++            sound_volume: 35,
++            sound_pack: SoundPack::Retro,
++            ui_sounds: false,
++            sound_events: sev::POWER | sev::BLUETOOTH,
++            alarm_tone: AlarmTone::Bell,
++            alarm_repeat: AlarmRepeat::Loop,
+             notifications: true,
+             fullscreen_mode: FullscreenMode::GameBar,
+             net_speed: false,
+@@ -483,7 +639,8 @@
+     #[test]
+     fn new_keys_parse_and_clamp() {
+         let c = parse("clip_images = 0\nimage_budget_mb = 1\npower_alerts = no\ntimer_sound = off\nstart_tab = timer");
+-        assert!(!c.clip_images && !c.power_alerts && !c.timer_sound);
++        assert!(!c.clip_images && !c.power_alerts);
++        assert_eq!(c.alarm_tone, AlarmTone::Off); // legacy key still silences the alarm
+         assert_eq!(c.image_budget_mb, 8);
+         assert_eq!(c.start_tab, Tab::Timer);
+         assert_eq!(parse("image_budget_mb = 99999").image_budget_mb, 512);
+@@ -495,6 +652,26 @@
+     }
+ 
+     #[test]
++    fn sound_keys_parse_and_clamp() {
++        let c = parse(
++            "sounds = 0\nsound_volume = 900\nsound_pack = GLASS\nui_sounds = no\n\
++             sound_events = copy, notify\nalarm_tone = bell\nalarm_repeat = loop",
++        );
++        assert!(!c.sounds && !c.ui_sounds);
++        assert_eq!(c.sound_volume, 100);
++        assert_eq!(c.sound_pack, SoundPack::Glass);
++        assert_eq!(c.sound_events, sev::COPY | sev::NOTIFY);
++        assert_eq!(c.alarm_tone, AlarmTone::Bell);
++        assert_eq!(c.alarm_repeat, AlarmRepeat::Loop);
++        assert_eq!(parse("sound_events = none").sound_events, 0);
++        assert_eq!(parse("alarm_repeat = 3").alarm_repeat, AlarmRepeat::Three);
++        assert_eq!(parse("alarm_repeat = once").alarm_repeat, AlarmRepeat::Once);
++        assert_eq!(parse("alarm_tone = nonsense").alarm_tone, AlarmTone::Chime);
++        // an explicit alarm_tone line after the legacy key wins
++        assert_eq!(parse("timer_sound = 0\nalarm_tone = beep").alarm_tone, AlarmTone::Beep);
++    }
++
++    #[test]
+     fn parses_and_clamps() {
+         let c = parse(
+             "expand_on = CLICK\nstyle=island\nstart_tab = system\nhover_delay_ms = 99999\n\
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' orig/src/ffi.rs src/src/ffi.rs
+--- a/src/ffi.rs	2026-11-25 21:38:03.385693345 +0100
++++ b/src/ffi.rs	2026-11-26 07:08:40.622856558 +0100
+@@ -203,7 +203,6 @@
+ pub const WM_POWERBROADCAST: u32 = 0x0218;
+ pub const PBT_APMPOWERSTATUSCHANGE: usize = 0x000A;
+ pub const CF_HDROP: u32 = 15;
+-pub const MB_ICONASTERISK: u32 = 0x40;
+ pub const WM_SETFOCUS: u32 = 0x0007;
+ pub const WM_KILLFOCUS: u32 = 0x0008;
+ pub const WM_KEYDOWN: u32 = 0x0100;
+@@ -319,7 +318,6 @@
+     pub fn OpenClipboard(hwnd: HANDLE) -> i32;
+     pub fn CloseClipboard() -> i32;
+     pub fn GetClipboardData(format: u32) -> HANDLE;
+-    pub fn MessageBeep(kind: u32) -> i32;
+     pub fn GetDpiForSystem() -> u32;
+     pub fn GetDpiForWindow(hwnd: HANDLE) -> u32;
+     pub fn SetProcessDpiAwarenessContext(ctx: isize) -> i32;
+@@ -760,3 +758,13 @@
+         assert_eq!(b, [97, 98, 99, 0]);
+     }
+ }
++
++// ---- sounds (sound.rs): play a WAV straight from memory ----------------------------------
++pub const SND_ASYNC: u32 = 0x0001;
++pub const SND_NODEFAULT: u32 = 0x0002;
++pub const SND_MEMORY: u32 = 0x0004;
++
++#[link(name = "winmm")]
++extern "system" {
++    pub fn PlaySoundW(sound: *const c_void, module: HANDLE, flags: u32) -> i32;
++}
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' orig/src/layout.rs src/src/layout.rs
+--- a/src/layout.rs	2026-11-25 21:38:03.386071580 +0100
++++ b/src/layout.rs	2026-11-25 21:42:53.416561162 +0100
+@@ -250,8 +250,13 @@
+     /// Clipboard row: a position in the *currently displayed* (filtered) list, not necessarily
+     /// an absolute index into the history - the caller maps it back using the same filter.
+     Row(usize),
+-    /// Settings control: (row index, sub-control index, see `settings::sub_rects`).
++    /// Settings control: (position in the current page's rows, sub-control index, see
++    /// `settings::sub_rects`).
+     Set(usize, u8),
++    /// Settings home page: category card `i` (`settings::Cat::ALL`).
++    Cat(u8),
++    /// "Back" to the Settings home page (sits in the header's left slot).
++    Back,
+     Preset(usize),
+     TimerMinus,
+     TimerToggle,
+@@ -261,8 +266,9 @@
+     Search,
+ }
+ 
+-/// `scroll` is the clipboard scroll position in rows (fractional while animating).
+-pub fn hit_test(g: &Geo, tab: Tab, x: f32, y: f32, scroll: f32, rows: usize) -> Hit {
++/// `scroll` is the clipboard / settings-list scroll position in rows (fractional while
++/// animating); `page` says what the Settings tab currently shows.
++pub fn hit_test(g: &Geo, tab: Tab, x: f32, y: f32, scroll: f32, rows: usize, page: &settings::Page) -> Hit {
+     if !g.pill.contains(x, y) {
+         return Hit::None;
+     }
+@@ -272,6 +278,9 @@
+     if matches!(tab, Tab::Clipboard | Tab::Timer) && g.clear.contains(x, y) {
+         return Hit::Clear;
+     }
++    if tab == Tab::Settings && page.cat.is_some() && g.clear.contains(x, y) {
++        return Hit::Back;
++    }
+     for (i, t) in g.tabs.iter().enumerate() {
+         if t.inflate_xy(2.0, 3.0).contains(x, y) {
+             return Hit::Tab(i);
+@@ -304,18 +313,11 @@
+                 }
+             }
+         }
+-        Tab::Settings => {
+-            if g.content.contains(x, y) {
+-                let idx = (scroll + (y - g.content.y) / ROW_H).floor();
+-                if idx >= 0.0 && (idx as usize) < rows.min(settings::ROWS.len()) {
+-                    let i = idx as usize;
+-                    let row_y = g.content.y + (i as f32 - scroll) * ROW_H;
+-                    if let Some(sub) = settings::hit(&settings::ROWS[i], settings_ctl_right(g.content), row_y, x, y) {
+-                        return Hit::Set(i, sub as u8);
+-                    }
+-                }
+-            }
+-        }
++        Tab::Settings => match settings::page_hit(page, g.content, scroll, x, y) {
++            Some(settings::PageHit::Cat(i)) => return Hit::Cat(i as u8),
++            Some(settings::PageHit::Row(i, sub)) => return Hit::Set(i, sub as u8),
++            None => {}
++        },
+         Tab::Timer => {
+             for (i, r) in g.t_presets.iter().enumerate() {
+                 if r.contains(x, y) {
+@@ -360,39 +362,39 @@
+         let g = geo(Style::Notch);
+         for i in 0..TAB_COUNT {
+             let t = g.tabs[i];
+-            assert_eq!(hit_test(&g, Tab::Media, t.cx(), t.cy(), 0.0, 0), Hit::Tab(i));
++            assert_eq!(hit_test(&g, Tab::Media, t.cx(), t.cy(), 0.0, 0, &home()), Hit::Tab(i));
+         }
+     }
+ 
+     #[test]
+     fn media_controls_hit() {
+         let g = geo(Style::Island);
+-        assert_eq!(hit_test(&g, Tab::Media, g.play.cx(), g.play.cy(), 0.0, 0), Hit::Play);
+-        assert_eq!(hit_test(&g, Tab::Media, g.prev.cx(), g.prev.cy(), 0.0, 0), Hit::Prev);
+-        assert_eq!(hit_test(&g, Tab::Media, g.next.cx(), g.next.cy(), 0.0, 0), Hit::Next);
+-        match hit_test(&g, Tab::Media, g.bar.x + g.bar.w * 0.25, g.bar.cy(), 0.0, 0) {
++        assert_eq!(hit_test(&g, Tab::Media, g.play.cx(), g.play.cy(), 0.0, 0, &home()), Hit::Play);
++        assert_eq!(hit_test(&g, Tab::Media, g.prev.cx(), g.prev.cy(), 0.0, 0, &home()), Hit::Prev);
++        assert_eq!(hit_test(&g, Tab::Media, g.next.cx(), g.next.cy(), 0.0, 0, &home()), Hit::Next);
++        match hit_test(&g, Tab::Media, g.bar.x + g.bar.w * 0.25, g.bar.cy(), 0.0, 0, &home()) {
+             Hit::Seek(f) => assert!((f - 0.25).abs() < 1e-3),
+             other => panic!("{other:?}"),
+         }
+         // Controls are not active on other tabs.
+-        assert_eq!(hit_test(&g, Tab::System, g.play.cx(), g.play.cy(), 0.0, 0), Hit::Body);
++        assert_eq!(hit_test(&g, Tab::System, g.play.cx(), g.play.cy(), 0.0, 0, &home()), Hit::Body);
+     }
+ 
+     #[test]
+     fn clipboard_rows_follow_scroll() {
+         let g = geo(Style::Notch);
+         let y0 = g.content.y + CLIP_LIST_OFFSET + 3.0;
+-        assert_eq!(hit_test(&g, Tab::Clipboard, g.content.cx(), y0, 0.0, 10), Hit::Row(0));
+-        assert_eq!(hit_test(&g, Tab::Clipboard, g.content.cx(), y0 + ROW_H, 0.0, 10), Hit::Row(1));
+-        assert_eq!(hit_test(&g, Tab::Clipboard, g.content.cx(), y0, 2.0, 10), Hit::Row(2));
++        assert_eq!(hit_test(&g, Tab::Clipboard, g.content.cx(), y0, 0.0, 10, &home()), Hit::Row(0));
++        assert_eq!(hit_test(&g, Tab::Clipboard, g.content.cx(), y0 + ROW_H, 0.0, 10, &home()), Hit::Row(1));
++        assert_eq!(hit_test(&g, Tab::Clipboard, g.content.cx(), y0, 2.0, 10, &home()), Hit::Row(2));
+         // Past the last item.
+-        assert_eq!(hit_test(&g, Tab::Clipboard, g.content.cx(), y0 + ROW_H * 3.0, 0.0, 2), Hit::Body);
++        assert_eq!(hit_test(&g, Tab::Clipboard, g.content.cx(), y0 + ROW_H * 3.0, 0.0, 2, &home()), Hit::Body);
+         // The search box sits above the list.
+-        assert_eq!(hit_test(&g, Tab::Clipboard, g.search.cx(), g.search.cy(), 0.0, 10), Hit::Search);
++        assert_eq!(hit_test(&g, Tab::Clipboard, g.search.cx(), g.search.cy(), 0.0, 10, &home()), Hit::Search);
+         // Clear button doubles as the Timer mode toggle, but exists nowhere else.
+-        assert_eq!(hit_test(&g, Tab::Clipboard, g.clear.cx(), g.clear.cy(), 0.0, 3), Hit::Clear);
+-        assert_eq!(hit_test(&g, Tab::Timer, g.clear.cx(), g.clear.cy(), 0.0, 3), Hit::Clear);
+-        assert_eq!(hit_test(&g, Tab::Media, g.clear.cx(), g.clear.cy(), 0.0, 3), Hit::Body);
++        assert_eq!(hit_test(&g, Tab::Clipboard, g.clear.cx(), g.clear.cy(), 0.0, 3, &home()), Hit::Clear);
++        assert_eq!(hit_test(&g, Tab::Timer, g.clear.cx(), g.clear.cy(), 0.0, 3, &home()), Hit::Clear);
++        assert_eq!(hit_test(&g, Tab::Media, g.clear.cx(), g.clear.cy(), 0.0, 3, &home()), Hit::Body);
+     }
+ 
+     #[test]
+@@ -408,8 +410,8 @@
+     #[test]
+     fn outside_is_none() {
+         let g = geo(Style::Notch);
+-        assert_eq!(hit_test(&g, Tab::Media, 2.0, 2.0, 0.0, 0), Hit::None);
+-        assert_eq!(hit_test(&g, Tab::Media, 240.0, 199.0, 0.0, 0), Hit::None);
++        assert_eq!(hit_test(&g, Tab::Media, 2.0, 2.0, 0.0, 0, &home()), Hit::None);
++        assert_eq!(hit_test(&g, Tab::Media, 240.0, 199.0, 0.0, 0, &home()), Hit::None);
+     }
+ 
+     #[test]
+@@ -443,34 +445,48 @@
+     fn timer_controls_hit_and_fit() {
+         let g = geo(Style::Island);
+         for (i, r) in g.t_presets.iter().enumerate() {
+-            assert_eq!(hit_test(&g, Tab::Timer, r.cx(), r.cy(), 0.0, 0), Hit::Preset(i));
++            assert_eq!(hit_test(&g, Tab::Timer, r.cx(), r.cy(), 0.0, 0, &home()), Hit::Preset(i));
+             assert!(r.right() <= g.content.right());
+         }
+-        assert_eq!(hit_test(&g, Tab::Timer, g.t_toggle.cx(), g.t_toggle.cy(), 0.0, 0), Hit::TimerToggle);
+-        assert_eq!(hit_test(&g, Tab::Timer, g.t_ring.cx(), g.t_ring.cy(), 0.0, 0), Hit::TimerToggle);
+-        assert_eq!(hit_test(&g, Tab::Timer, g.t_minus.cx(), g.t_minus.cy(), 0.0, 0), Hit::TimerMinus);
+-        assert_eq!(hit_test(&g, Tab::Timer, g.t_plus.cx(), g.t_plus.cy(), 0.0, 0), Hit::TimerPlus);
+-        assert_eq!(hit_test(&g, Tab::Timer, g.t_reset.cx(), g.t_reset.cy(), 0.0, 0), Hit::TimerReset);
++        assert_eq!(hit_test(&g, Tab::Timer, g.t_toggle.cx(), g.t_toggle.cy(), 0.0, 0, &home()), Hit::TimerToggle);
++        assert_eq!(hit_test(&g, Tab::Timer, g.t_ring.cx(), g.t_ring.cy(), 0.0, 0, &home()), Hit::TimerToggle);
++        assert_eq!(hit_test(&g, Tab::Timer, g.t_minus.cx(), g.t_minus.cy(), 0.0, 0, &home()), Hit::TimerMinus);
++        assert_eq!(hit_test(&g, Tab::Timer, g.t_plus.cx(), g.t_plus.cy(), 0.0, 0, &home()), Hit::TimerPlus);
++        assert_eq!(hit_test(&g, Tab::Timer, g.t_reset.cx(), g.t_reset.cy(), 0.0, 0, &home()), Hit::TimerReset);
+         assert!(g.t_reset.right() <= g.content.right() && g.t_reset.bottom() <= g.content.bottom());
+         // Timer controls do not exist on other tabs.
+-        assert_eq!(hit_test(&g, Tab::Media, g.t_reset.cx(), g.t_reset.cy(), 0.0, 0), Hit::Body);
++        assert_eq!(hit_test(&g, Tab::Media, g.t_reset.cx(), g.t_reset.cy(), 0.0, 0, &home()), Hit::Body);
+     }
+ 
+     #[test]
+-    fn settings_rows_hit_their_controls() {
++    fn settings_pages_hit_through_the_layout() {
++        use crate::config::Config;
++        use crate::settings::{Cat, Page};
+         let g = geo(Style::Notch);
+-        let n = settings::ROWS.len();
++        let c = Config::default();
++        // Home page: a card is a Cat hit, "Back" does not exist there.
++        let r = settings::card_rect(g.content, 3);
++        assert_eq!(hit_test(&g, Tab::Settings, r.cx(), r.cy(), 0.0, 0, &home()), Hit::Cat(3));
++        assert_eq!(hit_test(&g, Tab::Settings, g.clear.cx(), g.clear.cy(), 0.0, 0, &home()), Hit::Body);
++        // Category page: rows are Set hits, the header's left slot is Back.
++        let page = Page::new(Some(Cat::Look), &c);
+         let right = settings_ctl_right(g.content);
+-        for (i, row) in settings::ROWS.iter().enumerate().take(4) {
+-            let y = g.content.y + i as f32 * ROW_H;
+-            let (rects, count) = settings::sub_rects(row.ctl, right, y);
++        for (i, &id) in page.rows.as_slice().iter().enumerate() {
++            let (rects, count) = settings::sub_rects(settings::row(id).ctl, right, g.content.y + i as f32 * ROW_H);
+             for k in 0..count {
+-                let r = rects[k];
+-                assert_eq!(hit_test(&g, Tab::Settings, r.cx(), r.cy(), 0.0, n), Hit::Set(i, k as u8), "row {i} sub {k}");
++                let rc = rects[k];
++                assert_eq!(hit_test(&g, Tab::Settings, rc.cx(), rc.cy(), 0.0, 0, &page), Hit::Set(i, k as u8), "row {i} sub {k}");
+             }
+         }
+-        // Scrolled by two rows, the third visible row is row 5.
+-        let (rects, _) = settings::sub_rects(settings::ROWS[5].ctl, right, g.content.y + 3.0 * ROW_H);
+-        assert_eq!(hit_test(&g, Tab::Settings, rects[0].cx(), rects[0].cy(), 2.0, n), Hit::Set(5, 0));
++        assert_eq!(hit_test(&g, Tab::Settings, g.clear.cx(), g.clear.cy(), 0.0, 0, &page), Hit::Back);
++        // Back is a Settings-only button; tabs and the pin still win over the page.
++        assert_eq!(hit_test(&g, Tab::Clipboard, g.clear.cx(), g.clear.cy(), 0.0, 3, &page), Hit::Clear);
++        assert_eq!(hit_test(&g, Tab::Settings, g.tabs[0].cx(), g.tabs[0].cy(), 0.0, 0, &page), Hit::Tab(0));
++        // Home-page cards do not exist on other tabs.
++        assert_eq!(hit_test(&g, Tab::Media, r.cx(), r.cy(), 0.0, 0, &home()), Hit::Body);
++    }
++
++    fn home() -> settings::Page {
++        settings::Page::new(None, &crate::config::Config::default())
+     }
+ }
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' orig/src/main.rs src/src/main.rs
+--- a/src/main.rs	2026-11-25 21:38:03.386166940 +0100
++++ b/src/main.rs	2026-11-26 07:08:40.623094380 +0100
+@@ -20,6 +20,7 @@
+ mod ping;
+ mod power;
+ mod settings;
++mod sound;
+ mod spring;
+ mod sys;
+ mod timer;
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' orig/src/settings.rs src/src/settings.rs
+--- a/src/settings.rs	2026-11-25 21:38:03.386510984 +0100
++++ b/src/settings.rs	2026-11-26 07:09:36.910044343 +0100
+@@ -1,9 +1,15 @@
+-//! The Settings tab as data: which rows exist, what control each one has, where the control
+-//! sits and what a click on it does to the `Config`. No OS calls and no drawing, so the whole
+-//! thing is unit-tested; `ui.rs` paints it and `layout.rs` hit-tests it from the same numbers.
+-
+-use crate::config::{gb, Config, Dnd, ExpandOn, FullscreenMode};
+-use crate::layout::{Rect, Style, ROW_H};
++//! The Settings tab as data: the six categories, which rows each one holds, what control each row
++//! has, where the control sits and what a click on it does to the `Config`. No OS calls and no
++//! drawing, so the whole thing is unit-tested; `ui.rs` paints it and `layout.rs` hit-tests it
++//! from the same numbers.
++//!
++//! The tab has two levels: a home page with one card per category, and a category page that
++//! shows that category's rows (a list, or for Peeks a grid of switches).
++
++use crate::config::{
++    gb, sev, AlarmRepeat, AlarmTone, Config, Dnd, ExpandOn, FullscreenMode, SoundPack,
++};
++use crate::layout::{settings_ctl_right, Rect, Style, ROW_H, VISIBLE_ROWS};
+ 
+ /// Accent swatches offered in the UI (sub-control 0 is "auto", 1.. map to these).
+ pub const ACCENTS: [(u8, u8, u8); 6] =
+@@ -15,6 +21,9 @@
+ pub const GB_FRAMES: [u16; 4] = [gb::FPS, gb::LOW1, gb::LOW01, gb::FRAMETIME];
+ pub const GB_SYSTEM: [u16; 5] = [gb::CPU, gb::GPU, gb::RAM, gb::PING, gb::NET];
+ 
++/// Event-sound chips, in chip order (same order as `sound::EVENT_SOUNDS`).
++pub const EVENT_BITS: [u8; 4] = [sev::NOTIFY, sev::POWER, sev::COPY, sev::BLUETOOTH];
++
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum Id {
+     ExpandOn,
+@@ -24,7 +33,6 @@
+     Equalizer,
+     AutoPeek,
+     PowerAlerts,
+-    TimerSound,
+     Privacy,
+     HideFullscreen,
+     ClipImages,
+@@ -44,6 +52,14 @@
+     BtPeek,
+     PrivacyDot,
+     Dnd,
++    SoundsOn,
++    SoundVolume,
++    SoundPack,
++    UiSounds,
++    EventSounds,
++    AlarmTone,
++    AlarmRepeat,
++    SoundFiles,
+ }
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -68,7 +84,7 @@
+     pub ctl: Ctl,
+ }
+ 
+-pub const ROWS: [Row; 27] = [
++pub const ROWS: [Row; 34] = [
+     Row { id: Id::ExpandOn, label: "Expand on", ctl: Ctl::Seg(&["Hover", "Click"]) },
+     Row { id: Id::Style, label: "Style", ctl: Ctl::Seg(&["Notch", "Island"]) },
+     Row { id: Id::Accent, label: "Accent colour", ctl: Ctl::Swatch },
+@@ -76,7 +92,6 @@
+     Row { id: Id::Equalizer, label: "Equalizer bars", ctl: Ctl::Toggle },
+     Row { id: Id::AutoPeek, label: "Peek on track / copy", ctl: Ctl::Toggle },
+     Row { id: Id::PowerAlerts, label: "Battery & charger alerts", ctl: Ctl::Toggle },
+-    Row { id: Id::TimerSound, label: "Timer sound", ctl: Ctl::Toggle },
+     Row { id: Id::ClipImages, label: "Clipboard images", ctl: Ctl::Toggle },
+     Row { id: Id::Notifications, label: "Notification peeks", ctl: Ctl::Toggle },
+     Row { id: Id::VolumePeek, label: "Volume peek", ctl: Ctl::Toggle },
+@@ -96,13 +111,272 @@
+     Row { id: Id::NetSpeed, label: "Live network speed", ctl: Ctl::Toggle },
+     Row { id: Id::Autostart, label: "Start with Windows", ctl: Ctl::Toggle },
+     Row { id: Id::ConfigFile, label: "Config file", ctl: Ctl::Buttons(&["Open", "Reload"]) },
++    Row { id: Id::SoundsOn, label: "Sounds", ctl: Ctl::Toggle },
++    Row { id: Id::SoundVolume, label: "Volume", ctl: Ctl::Step },
++    Row { id: Id::SoundPack, label: "Sound pack", ctl: Ctl::Seg(&["Soft", "Glass", "Retro"]) },
++    Row { id: Id::UiSounds, label: "UI sounds", ctl: Ctl::Toggle },
++    Row { id: Id::EventSounds, label: "Event sounds", ctl: Ctl::Chips(&["Notify", "Power", "Copy", "BT"]) },
++    Row { id: Id::AlarmTone, label: "Timer alarm", ctl: Ctl::Seg(&["Off", "Chime", "Beep", "Bell"]) },
++    Row { id: Id::AlarmRepeat, label: "Alarm repeat", ctl: Ctl::Seg(&["Once", "3\u{d7}", "Loop"]) },
++    Row { id: Id::SoundFiles, label: "Own sounds (.wav)", ctl: Ctl::Buttons(&["Folder", "Reload"]) },
+ ];
+ 
++/// The row definition for an id.
++pub fn row(id: Id) -> &'static Row {
++    ROWS.iter().find(|r| r.id == id).unwrap_or(&ROWS[0])
++}
++
++// ------------------------------------------------------------------------------- categories
++
++/// The six categories on the Settings home page, in display order (3 x 2 cards).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Cat {
++    Look,
++    General,
++    Peeks,
++    Sounds,
++    Focus,
++    Data,
++}
++
++impl Cat {
++    pub const ALL: [Cat; 6] = [Cat::Look, Cat::General, Cat::Peeks, Cat::Sounds, Cat::Focus, Cat::Data];
++
++    pub fn from_index(i: usize) -> Cat {
++        Self::ALL[i.min(Self::ALL.len() - 1)]
++    }
++
++    pub fn title(self) -> &'static str {
++        match self {
++            Cat::Look => "Look & feel",
++            Cat::General => "General",
++            Cat::Peeks => "Peeks",
++            Cat::Sounds => "Sounds",
++            Cat::Focus => "Focus & games",
++            Cat::Data => "Data",
++        }
++    }
++
++    /// Peeks are all switches: they are drawn as a compact grid instead of a list.
++    pub fn is_grid(self) -> bool {
++        self == Cat::Peeks
++    }
++}
++
++/// Short label for a switch in the Peeks grid.
++pub fn grid_label(id: Id) -> &'static str {
++    match id {
++        Id::AutoPeek => "Track / copy",
++        Id::PowerAlerts => "Battery",
++        Id::Notifications => "Notifications",
++        Id::VolumePeek => "Volume",
++        Id::BrightnessPeek => "Brightness",
++        Id::LockPeek => "Caps / Num Lock",
++        Id::BtPeek => "Bluetooth",
++        Id::PrivacyDot => "Mic & camera",
++        _ => row(id).label,
++    }
++}
++
++pub const MAX_PAGE_ROWS: usize = 8;
++
++/// The rows currently shown on a category page (some depend on other settings).
++#[derive(Clone, Copy, Debug)]
++pub struct RowList {
++    ids: [Id; MAX_PAGE_ROWS],
++    n: usize,
++}
++
++impl RowList {
++    fn from(list: &[Id]) -> RowList {
++        let mut ids = [Id::ExpandOn; MAX_PAGE_ROWS];
++        let n = list.len().min(MAX_PAGE_ROWS);
++        ids[..n].copy_from_slice(&list[..n]);
++        RowList { ids, n }
++    }
++    pub fn as_slice(&self) -> &[Id] {
++        &self.ids[..self.n]
++    }
++    pub fn len(&self) -> usize {
++        self.n
++    }
++}
++
++/// Rows of a category. Sounds shows only the master switch while sounds are off, and Focus shows
++/// the game-bar chips only while "Full screen behaviour" is "Game bar".
++pub fn rows_of(cat: Cat, c: &Config) -> RowList {
++    match cat {
++        Cat::Look => RowList::from(&[Id::Style, Id::Accent, Id::AlbumArt, Id::Equalizer]),
++        Cat::General => RowList::from(&[Id::ExpandOn, Id::HoverDelay, Id::Fps, Id::Autostart, Id::ConfigFile]),
++        Cat::Peeks => RowList::from(&[
++            Id::AutoPeek,
++            Id::PowerAlerts,
++            Id::Notifications,
++            Id::VolumePeek,
++            Id::BrightnessPeek,
++            Id::LockPeek,
++            Id::BtPeek,
++            Id::PrivacyDot,
++        ]),
++        Cat::Sounds => {
++            if c.sounds {
++                RowList::from(&[
++                    Id::SoundsOn,
++                    Id::SoundVolume,
++                    Id::SoundPack,
++                    Id::UiSounds,
++                    Id::EventSounds,
++                    Id::AlarmTone,
++                    Id::AlarmRepeat,
++                    Id::SoundFiles,
++                ])
++            } else {
++                RowList::from(&[Id::SoundsOn])
++            }
++        }
++        Cat::Focus => {
++            if c.fullscreen_mode == FullscreenMode::GameBar {
++                RowList::from(&[Id::Dnd, Id::HideFullscreen, Id::FullscreenMode, Id::GameFrames, Id::GameSystem])
++            } else {
++                RowList::from(&[Id::Dnd, Id::HideFullscreen, Id::FullscreenMode])
++            }
++        }
++        Cat::Data => RowList::from(&[Id::ClipImages, Id::Privacy, Id::HistorySize, Id::NetSpeed]),
++    }
++}
++
++/// One-line live summary on a category card.
++pub fn summary(cat: Cat, c: &Config) -> String {
++    match cat {
++        Cat::Look => format!(
++            "{} \u{b7} {}",
++            if c.style == Style::Island { "Island" } else { "Notch" },
++            if c.accent.is_some() { "custom" } else { "auto" }
++        ),
++        Cat::General => format!(
++            "{} \u{b7} {} fps",
++            if c.expand_on == ExpandOn::Click { "Click" } else { "Hover" },
++            c.fps_cap
++        ),
++        Cat::Peeks => {
++            let on = rows_of(Cat::Peeks, c).as_slice().iter().filter(|&&id| toggle_cfg(id, c)).count();
++            format!("{on} of {} on", rows_of(Cat::Peeks, c).len())
++        }
++        Cat::Sounds => {
++            if c.sounds {
++                let pack = match c.sound_pack {
++                    SoundPack::Soft => "Soft",
++                    SoundPack::Glass => "Glass",
++                    SoundPack::Retro => "Retro",
++                };
++                format!("{pack} \u{b7} {}%", c.sound_volume)
++            } else {
++                "Off".to_string()
++            }
++        }
++        Cat::Focus => format!(
++            "DND {} \u{b7} {}",
++            match c.dnd {
++                Dnd::Off => "off",
++                Dnd::On => "on",
++                Dnd::Games => "games",
++            },
++            if c.fullscreen_mode == FullscreenMode::GameBar { "bar" } else { "hide" }
++        ),
++        Cat::Data => format!("{} clips \u{b7} {}", c.history_size, if c.clip_images { "images" } else { "text" }),
++    }
++}
++
++/// What the Settings tab currently shows: the home page (`cat` = None) or a category.
++#[derive(Clone, Copy, Debug)]
++pub struct Page {
++    pub cat: Option<Cat>,
++    pub rows: RowList,
++}
++
++impl Page {
++    pub fn new(cat: Option<Cat>, c: &Config) -> Page {
++        Page { cat, rows: cat.map_or(RowList::from(&[]), |k| rows_of(k, c)) }
++    }
++
++    pub fn is_grid(&self) -> bool {
++        self.cat.is_some_and(Cat::is_grid)
++    }
++
++    /// How far a list page can scroll, in rows (home page and grid never scroll).
++    pub fn max_scroll(&self) -> f32 {
++        match self.cat {
++            Some(k) if !k.is_grid() => self.rows.len().saturating_sub(VISIBLE_ROWS) as f32,
++            _ => 0.0,
++        }
++    }
++}
++
++// ------------------------------------------------------------------------------------ geometry
++
++pub const CARD_W: f32 = 132.0;
++pub const CARD_H: f32 = 52.0;
++const CARD_GAP_X: f32 = 10.0;
++const CARD_GAP_Y: f32 = 8.0;
++
++/// Category card `i` (3 per row) on the home page.
++pub fn card_rect(content: Rect, i: usize) -> Rect {
++    let (col, line) = ((i % 3) as f32, (i / 3) as f32);
++    Rect::new(content.x + col * (CARD_W + CARD_GAP_X), content.y + line * (CARD_H + CARD_GAP_Y), CARD_W, CARD_H)
++}
++
++pub const CHIP_W_GRID: f32 = 134.0;
++pub const CHIP_H_GRID: f32 = 34.0;
++const GRID_GAP_X: f32 = 7.0;
++const GRID_GAP_Y: f32 = 5.0;
++
++/// Switch `i` (3 per row) of the Peeks grid.
++pub fn grid_rect(content: Rect, i: usize) -> Rect {
++    let (col, line) = ((i % 3) as f32, (i / 3) as f32);
++    Rect::new(
++        content.x + col * (CHIP_W_GRID + GRID_GAP_X),
++        content.y + line * (CHIP_H_GRID + GRID_GAP_Y),
++        CHIP_W_GRID,
++        CHIP_H_GRID,
++    )
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum PageHit {
++    /// A category card on the home page.
++    Cat(usize),
++    /// (position in `Page::rows`, sub-control).
++    Row(usize, usize),
++}
++
++/// What is under (x, y) on the Settings page. `scroll` is the list scroll in rows.
++pub fn page_hit(page: &Page, content: Rect, scroll: f32, x: f32, y: f32) -> Option<PageHit> {
++    if !content.contains(x, y) {
++        return None;
++    }
++    match page.cat {
++        None => (0..Cat::ALL.len()).find(|&i| card_rect(content, i).contains(x, y)).map(PageHit::Cat),
++        Some(k) if k.is_grid() => {
++            (0..page.rows.len()).find(|&i| grid_rect(content, i).contains(x, y)).map(|i| PageHit::Row(i, 0))
++        }
++        Some(_) => {
++            let idx = (scroll + (y - content.y) / ROW_H).floor();
++            if idx < 0.0 {
++                return None;
++            }
++            let i = idx as usize;
++            let id = *page.rows.as_slice().get(i)?;
++            let row_y = content.y + (i as f32 - scroll) * ROW_H;
++            hit(row(id), settings_ctl_right(content), row_y, x, y).map(|s| PageHit::Row(i, s))
++        }
++    }
++}
++
+ const CTL_H: f32 = 20.0;
+ const CHIP_W: f32 = 42.0;
+ 
+ fn seg_w(labels: &[&str]) -> f32 {
+-    if labels.iter().all(|l| l.len() <= 3) {
++    if labels.iter().all(|l| l.chars().count() <= 3) {
+         38.0
+     } else {
+         56.0
+@@ -175,6 +449,8 @@
+     None
+ }
+ 
++// --------------------------------------------------------------------------------------- state
++
+ /// Read-only state the rows need besides the config.
+ #[derive(Clone, Copy, Debug)]
+ pub struct View<'a> {
+@@ -182,14 +458,12 @@
+     pub autostart: bool,
+ }
+ 
+-pub fn toggle_on(id: Id, v: &View) -> bool {
+-    let c = v.cfg;
++fn toggle_cfg(id: Id, c: &Config) -> bool {
+     match id {
+         Id::AlbumArt => c.album_art,
+         Id::Equalizer => c.equalizer,
+         Id::AutoPeek => c.auto_peek,
+         Id::PowerAlerts => c.power_alerts,
+-        Id::TimerSound => c.timer_sound,
+         Id::ClipImages => c.clip_images,
+         Id::Privacy => c.privacy_filter,
+         Id::HideFullscreen => c.hide_fullscreen,
+@@ -200,11 +474,20 @@
+         Id::LockPeek => c.lock_peek,
+         Id::BtPeek => c.bt_peek,
+         Id::PrivacyDot => c.privacy_dot,
+-        Id::Autostart => v.autostart,
++        Id::SoundsOn => c.sounds,
++        Id::UiSounds => c.ui_sounds,
+         _ => false,
+     }
+ }
+ 
++pub fn toggle_on(id: Id, v: &View) -> bool {
++    if id == Id::Autostart {
++        v.autostart
++    } else {
++        toggle_cfg(id, v.cfg)
++    }
++}
++
+ /// Selected option of a segmented control.
+ pub fn seg_selected(id: Id, c: &Config) -> Option<usize> {
+     match id {
+@@ -217,6 +500,22 @@
+             Dnd::On => 1,
+             Dnd::Games => 2,
+         }),
++        Id::SoundPack => Some(match c.sound_pack {
++            SoundPack::Soft => 0,
++            SoundPack::Glass => 1,
++            SoundPack::Retro => 2,
++        }),
++        Id::AlarmTone => Some(match c.alarm_tone {
++            AlarmTone::Off => 0,
++            AlarmTone::Chime => 1,
++            AlarmTone::Beep => 2,
++            AlarmTone::Bell => 3,
++        }),
++        Id::AlarmRepeat => Some(match c.alarm_repeat {
++            AlarmRepeat::Once => 0,
++            AlarmRepeat::Three => 1,
++            AlarmRepeat::Loop => 2,
++        }),
+         _ => None,
+     }
+ }
+@@ -231,6 +530,9 @@
+ 
+ /// Is chip `k` of row `id` switched on?
+ pub fn chip_on(id: Id, c: &Config, k: usize) -> bool {
++    if id == Id::EventSounds {
++        return EVENT_BITS.get(k).is_some_and(|b| c.sound_events & b != 0);
++    }
+     chip_bits(id).get(k).is_some_and(|b| c.game_items & b != 0)
+ }
+ 
+@@ -246,6 +548,7 @@
+     match id {
+         Id::HistorySize => c.history_size.to_string(),
+         Id::HoverDelay => format!("{} ms", c.hover_delay_ms),
++        Id::SoundVolume => format!("{}%", c.sound_volume),
+         _ => String::new(),
+     }
+ }
+@@ -258,6 +561,8 @@
+     Changed,
+     Autostart(bool),
+     OpenConfig,
++    /// Open the folder for your own `.wav` files (created on demand).
++    OpenSounds,
+     Reload,
+ }
+ 
+@@ -278,7 +583,6 @@
+         Id::Equalizer => c.equalizer = !c.equalizer,
+         Id::AutoPeek => c.auto_peek = !c.auto_peek,
+         Id::PowerAlerts => c.power_alerts = !c.power_alerts,
+-        Id::TimerSound => c.timer_sound = !c.timer_sound,
+         Id::ClipImages => c.clip_images = !c.clip_images,
+         Id::Notifications => c.notifications = !c.notifications,
+         Id::NetSpeed => c.net_speed = !c.net_speed,
+@@ -315,8 +619,42 @@
+                 c.fps_cap = f;
+             }
+         }
++        Id::SoundsOn => c.sounds = !c.sounds,
++        Id::SoundVolume => {
++            let d = if sub == 0 { -1 } else { 1 };
++            c.sound_volume = step(c.sound_volume as i64, d, 10, 0, 100) as u32;
++        }
++        Id::SoundPack => {
++            c.sound_pack = match sub {
++                1 => SoundPack::Glass,
++                2 => SoundPack::Retro,
++                _ => SoundPack::Soft,
++            }
++        }
++        Id::UiSounds => c.ui_sounds = !c.ui_sounds,
++        Id::EventSounds => {
++            if let Some(b) = EVENT_BITS.get(sub) {
++                c.sound_events ^= b;
++            }
++        }
++        Id::AlarmTone => {
++            c.alarm_tone = match sub {
++                1 => AlarmTone::Chime,
++                2 => AlarmTone::Beep,
++                3 => AlarmTone::Bell,
++                _ => AlarmTone::Off,
++            }
++        }
++        Id::AlarmRepeat => {
++            c.alarm_repeat = match sub {
++                0 => AlarmRepeat::Once,
++                2 => AlarmRepeat::Loop,
++                _ => AlarmRepeat::Three,
++            }
++        }
+         Id::Autostart => return Action::Autostart(!autostart),
+         Id::ConfigFile => return if sub == 0 { Action::OpenConfig } else { Action::Reload },
++        Id::SoundFiles => return if sub == 0 { Action::OpenSounds } else { Action::Reload },
+     }
+     if *c != before {
+         Action::Changed
+@@ -328,6 +666,11 @@
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::layout::{geo, Style as LStyle};
++
++    fn all_on() -> Config {
++        Config { sounds: true, fullscreen_mode: FullscreenMode::GameBar, ..Config::default() }
++    }
+ 
+     #[test]
+     fn every_row_has_rects_inside_the_row() {
+@@ -357,6 +700,144 @@
+     }
+ 
+     #[test]
++    fn row_ids_are_unique_and_found() {
++        for (i, a) in ROWS.iter().enumerate() {
++            assert_eq!(row(a.id).id, a.id);
++            for b in ROWS.iter().skip(i + 1) {
++                assert_ne!(a.id, b.id);
++            }
++        }
++    }
++
++    #[test]
++    fn every_row_lives_in_exactly_one_category() {
++        let c = all_on();
++        let mut seen: Vec<Id> = Vec::new();
++        for cat in Cat::ALL {
++            let list = rows_of(cat, &c);
++            assert!(list.len() >= 1 && list.len() <= MAX_PAGE_ROWS, "{cat:?}");
++            for &id in list.as_slice() {
++                assert!(!seen.contains(&id), "{id:?} appears twice");
++                seen.push(id);
++            }
++        }
++        for r in ROWS.iter() {
++            assert!(seen.contains(&r.id), "{:?} is in no category", r.id);
++        }
++        assert_eq!(seen.len(), ROWS.len());
++    }
++
++    #[test]
++    fn pages_stay_small_and_hidden_rows_follow_their_switch() {
++        let mut c = Config::default();
++        assert_eq!(rows_of(Cat::Focus, &c).len(), 3); // game-bar chips hidden
++        c.fullscreen_mode = FullscreenMode::GameBar;
++        assert_eq!(rows_of(Cat::Focus, &c).len(), 5);
++        assert_eq!(rows_of(Cat::Sounds, &c).len(), 8);
++        c.sounds = false;
++        assert_eq!(rows_of(Cat::Sounds, &c).as_slice(), &[Id::SoundsOn]);
++        // Only Focus (game bar on), General and Sounds scroll; Look and Data fit exactly.
++        assert_eq!(Page::new(Some(Cat::Look), &c).max_scroll(), 0.0);
++        assert_eq!(Page::new(Some(Cat::Data), &c).max_scroll(), 0.0);
++        assert_eq!(Page::new(Some(Cat::General), &c).max_scroll(), 1.0);
++        assert_eq!(Page::new(Some(Cat::Peeks), &c).max_scroll(), 0.0);
++        assert_eq!(Page::new(None, &c).max_scroll(), 0.0);
++        c.sounds = true;
++        assert_eq!(Page::new(Some(Cat::Sounds), &c).max_scroll(), 4.0);
++    }
++
++    #[test]
++    fn peeks_are_all_switches() {
++        let c = Config::default();
++        for &id in rows_of(Cat::Peeks, &c).as_slice() {
++            assert_eq!(row(id).ctl, Ctl::Toggle, "{id:?}");
++            assert!(!grid_label(id).is_empty());
++        }
++        assert!(rows_of(Cat::Peeks, &c).len() <= 9);
++    }
++
++    #[test]
++    fn cards_and_grid_fit_the_content_area_without_overlap() {
++        let content = geo(LStyle::Notch).content;
++        let rects: Vec<Rect> = (0..6).map(|i| card_rect(content, i)).collect();
++        let grid: Vec<Rect> = (0..9).map(|i| grid_rect(content, i)).collect();
++        for set in [&rects, &grid] {
++            for (i, r) in set.iter().enumerate() {
++                assert!(r.x >= content.x - 0.01 && r.right() <= content.right() + 0.01, "{i}");
++                assert!(r.y >= content.y - 0.01 && r.bottom() <= content.bottom() + 0.01, "{i}");
++                for o in set.iter().skip(i + 1) {
++                    let apart = r.right() <= o.x || o.right() <= r.x || r.bottom() <= o.y || o.bottom() <= r.y;
++                    assert!(apart, "cells overlap");
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn home_page_hits_cards() {
++        let g = geo(LStyle::Notch);
++        let page = Page::new(None, &Config::default());
++        for i in 0..6 {
++            let r = card_rect(g.content, i);
++            assert_eq!(page_hit(&page, g.content, 0.0, r.cx(), r.cy()), Some(PageHit::Cat(i)));
++        }
++        // the gap between two cards is nothing
++        let a = card_rect(g.content, 0);
++        assert_eq!(page_hit(&page, g.content, 0.0, a.right() + 4.0, a.cy()), None);
++        assert_eq!(page_hit(&page, g.content, 0.0, 1.0, 1.0), None);
++    }
++
++    #[test]
++    fn grid_page_hits_switches() {
++        let g = geo(LStyle::Island);
++        let c = Config::default();
++        let page = Page::new(Some(Cat::Peeks), &c);
++        for i in 0..page.rows.len() {
++            let r = grid_rect(g.content, i);
++            assert_eq!(page_hit(&page, g.content, 0.0, r.cx(), r.cy()), Some(PageHit::Row(i, 0)));
++        }
++        // the 9th cell is empty
++        let r = grid_rect(g.content, 8);
++        assert_eq!(page_hit(&page, g.content, 0.0, r.cx(), r.cy()), None);
++    }
++
++    #[test]
++    fn list_page_hits_controls_and_follows_scroll() {
++        let g = geo(LStyle::Notch);
++        let c = all_on();
++        let page = Page::new(Some(Cat::Sounds), &c);
++        let right = settings_ctl_right(g.content);
++        for (i, &id) in page.rows.as_slice().iter().enumerate().take(4) {
++            let y = g.content.y + i as f32 * ROW_H;
++            let (rects, count) = sub_rects(row(id).ctl, right, y);
++            for k in 0..count {
++                let r = rects[k];
++                assert_eq!(page_hit(&page, g.content, 0.0, r.cx(), r.cy()), Some(PageHit::Row(i, k)), "row {i} sub {k}");
++            }
++        }
++        // Scrolled by two rows, the third visible row is row 4 (event chips).
++        let (rects, _) = sub_rects(row(page.rows.as_slice()[4]).ctl, right, g.content.y + 2.0 * ROW_H);
++        assert_eq!(page_hit(&page, g.content, 2.0, rects[1].cx(), rects[1].cy()), Some(PageHit::Row(4, 1)));
++        // Below the last row is nothing.
++        let small = Page::new(Some(Cat::Sounds), &Config { sounds: false, ..c });
++        assert_eq!(page_hit(&small, g.content, 0.0, g.content.cx(), g.content.y + 2.0 * ROW_H), None);
++    }
++
++    #[test]
++    fn summaries_fit_a_card() {
++        let mut c = all_on();
++        c.accent = Some((1, 2, 3));
++        c.dnd = Dnd::Games;
++        c.history_size = 100;
++        for cat in Cat::ALL {
++            let s = summary(cat, &c);
++            assert!(!s.is_empty() && s.chars().count() <= 20, "{cat:?}: {s}");
++        }
++        assert_eq!(summary(Cat::Sounds, &Config { sounds: false, ..c.clone() }), "Off");
++        assert_eq!(summary(Cat::Peeks, &Config::default()), format!("{} of 8 on", 7));
++    }
++
++    #[test]
+     fn new_rows_toggle_and_dnd_cycles() {
+         let mut c = Config::default();
+         assert_eq!(apply(&mut c, false, Id::VolumePeek, 0), Action::Changed);
+@@ -369,11 +850,10 @@
+ 
+     #[test]
+     fn toggles_hit_anywhere_in_the_row() {
+-        let row = ROWS.iter().find(|r| r.id == Id::AlbumArt).unwrap();
+-        assert_eq!(hit(row, 400.0, 50.0, 10.0, 60.0), Some(0));
+-        assert_eq!(hit(row, 400.0, 50.0, 10.0, 49.0), None);
+-        let seg = &ROWS[0];
+-        assert_eq!(hit(seg, 400.0, 50.0, 10.0, 60.0), None);
++        let r = row(Id::AlbumArt);
++        assert_eq!(hit(r, 400.0, 50.0, 10.0, 60.0), Some(0));
++        assert_eq!(hit(r, 400.0, 50.0, 10.0, 49.0), None);
++        assert_eq!(hit(&ROWS[0], 400.0, 50.0, 10.0, 60.0), None);
+     }
+ 
+     #[test]
+@@ -410,6 +890,8 @@
+         assert!(toggle_on(Id::Autostart, &View { cfg: &c, autostart: true }));
+         assert_eq!(apply(&mut c, false, Id::ConfigFile, 0), Action::OpenConfig);
+         assert_eq!(apply(&mut c, false, Id::ConfigFile, 1), Action::Reload);
++        assert_eq!(apply(&mut c, false, Id::SoundFiles, 0), Action::OpenSounds);
++        assert_eq!(apply(&mut c, false, Id::SoundFiles, 1), Action::Reload);
+     }
+ 
+     #[test]
+@@ -464,11 +946,43 @@
+     }
+ 
+     #[test]
+-    fn row_ids_are_unique() {
+-        for (i, a) in ROWS.iter().enumerate() {
+-            for b in ROWS.iter().skip(i + 1) {
+-                assert_ne!(a.id, b.id);
+-            }
+-        }
++    fn sound_rows_edit_the_sound_config() {
++        let mut c = Config::default();
++        assert!(toggle_on(Id::SoundsOn, &View { cfg: &c, autostart: false }));
++        assert_eq!(apply(&mut c, false, Id::SoundVolume, 1), Action::Changed);
++        assert_eq!(c.sound_volume, 70);
++        assert_eq!(step_text(Id::SoundVolume, &c), "70%");
++        c.sound_volume = 100;
++        assert_eq!(apply(&mut c, false, Id::SoundVolume, 1), Action::Nothing);
++        c.sound_volume = 0;
++        assert_eq!(apply(&mut c, false, Id::SoundVolume, 0), Action::Nothing);
++
++        assert_eq!(apply(&mut c, false, Id::SoundPack, 2), Action::Changed);
++        assert_eq!(c.sound_pack, SoundPack::Retro);
++        assert_eq!(seg_selected(Id::SoundPack, &c), Some(2));
++        assert_eq!(apply(&mut c, false, Id::SoundPack, 2), Action::Nothing);
++
++        assert_eq!(seg_selected(Id::AlarmTone, &c), Some(1)); // chime by default
++        assert_eq!(apply(&mut c, false, Id::AlarmTone, 3), Action::Changed);
++        assert_eq!(c.alarm_tone, AlarmTone::Bell);
++        assert_eq!(apply(&mut c, false, Id::AlarmTone, 0), Action::Changed);
++        assert_eq!(c.alarm_tone, AlarmTone::Off);
++
++        assert_eq!(seg_selected(Id::AlarmRepeat, &c), Some(1)); // 3x by default
++        apply(&mut c, false, Id::AlarmRepeat, 2);
++        assert_eq!(c.alarm_repeat, AlarmRepeat::Loop);
++        apply(&mut c, false, Id::AlarmRepeat, 0);
++        assert_eq!(c.alarm_repeat, AlarmRepeat::Once);
++
++        assert!(chip_on(Id::EventSounds, &c, 2));
++        assert_eq!(apply(&mut c, false, Id::EventSounds, 2), Action::Changed);
++        assert!(!chip_on(Id::EventSounds, &c, 2));
++        assert_eq!(c.sound_events, sev::NOTIFY | sev::POWER | sev::BLUETOOTH);
++        assert_eq!(apply(&mut c, false, Id::EventSounds, 9), Action::Nothing);
++
++        assert_eq!(apply(&mut c, false, Id::UiSounds, 0), Action::Changed);
++        assert!(!c.ui_sounds);
++        assert_eq!(apply(&mut c, false, Id::SoundsOn, 0), Action::Changed);
++        assert!(!c.sounds);
+     }
+ }
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' orig/src/sound.rs src/src/sound.rs
+--- a/src/sound.rs	1970-01-01 01:00:00.000000000 +0100
++++ b/src/sound.rs	2026-11-26 07:09:36.916630284 +0100
+@@ -0,0 +1,747 @@
++//! Sounds. No audio files are embedded: the built-in tones are synthesised at start-up from the
++//! small note tables below, so the app stays a single .exe. Playback is winmm `PlaySoundW` from
++//! memory (async, nothing runs in the background).
++//!
++//! HOW TO CHANGE SOUNDS
++//!   1. Easiest: drop your own `.wav` into `%APPDATA%\NotchIsland\sounds\` (tray menu ->
++//!      "Open sounds folder"), named after the sound (see `Sound::stem`), then "Reload config".
++//!      A file there always wins over the generated sound. 8/16-bit PCM, mono or stereo, up to 4 MB.
++//!   2. Tweak the built-in tones: edit the note tables right below (`hz`, `at_ms`, `len_ms`, `gain`)
++//!      or the three packs in `pack_style`.
++//!   3. Add a brand-new sound: add a variant to `Sound` (+ `ALL`, `stem`), give it a recipe in
++//!      `recipe`, and call `sounds.ui(..)` / `sounds.event(..)` where it should play.
++//!
++//! No OS calls except the two thin wrappers at the bottom, so everything else is unit-tested.
++
++use crate::config::{sev, AlarmRepeat, AlarmTone, Config, SoundPack};
++use std::path::PathBuf;
++use std::time::{Duration, Instant};
++
++/// Every sound the island can make. The name is also the `.wav` file name you can override it with.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Sound {
++    /// Click on a tab, button or setting.
++    Tick,
++    /// The island expands.
++    Open,
++    /// The island collapses.
++    Close,
++    /// A Windows notification arrives.
++    Notify,
++    /// Charger plugged / unplugged, battery low / full.
++    Power,
++    /// Something was copied to the clipboard.
++    Copy,
++    /// A Bluetooth device connects / disconnects.
++    Bluetooth,
++    /// The countdown timer ends (repeats per `alarm_repeat`).
++    Alarm,
++    /// A reminder comes due (plays once; falls back to `alarm.wav` if there is no `reminder.wav`).
++    Reminder,
++}
++
++impl Sound {
++    pub const ALL: [Sound; 9] = [
++        Sound::Tick,
++        Sound::Open,
++        Sound::Close,
++        Sound::Notify,
++        Sound::Power,
++        Sound::Copy,
++        Sound::Bluetooth,
++        Sound::Alarm,
++        Sound::Reminder,
++    ];
++
++    /// File name (without `.wav`) of the user override for this sound.
++    pub fn stem(self) -> &'static str {
++        match self {
++            Sound::Tick => "tick",
++            Sound::Open => "open",
++            Sound::Close => "close",
++            Sound::Notify => "notify",
++            Sound::Power => "power",
++            Sound::Copy => "copy",
++            Sound::Bluetooth => "bluetooth",
++            Sound::Alarm => "alarm",
++            Sound::Reminder => "reminder",
++        }
++    }
++
++    fn idx(self) -> usize {
++        self as usize
++    }
++}
++
++// ------------------------------------------------------------------ note tables (edit me)
++
++/// One tone: frequency in Hz, when it starts and how long it rings (ms), relative loudness.
++#[derive(Clone, Copy, Debug)]
++pub struct Note {
++    pub hz: f32,
++    pub at_ms: u32,
++    pub len_ms: u32,
++    pub gain: f32,
++}
++
++const fn n(hz: f32, at_ms: u32, len_ms: u32) -> Note {
++    Note { hz, at_ms, len_ms, gain: 1.0 }
++}
++
++const fn ng(hz: f32, at_ms: u32, len_ms: u32, gain: f32) -> Note {
++    Note { hz, at_ms, len_ms, gain }
++}
++
++const TICK: &[Note] = &[n(1300.0, 0, 35)];
++const OPEN: &[Note] = &[n(660.0, 0, 70), n(990.0, 45, 110)]; // rising
++const CLOSE: &[Note] = &[n(880.0, 0, 70), n(587.0, 45, 110)]; // falling
++const NOTIFY: &[Note] = &[n(784.0, 0, 140), n(1175.0, 120, 240)];
++const POWER: &[Note] = &[n(523.0, 0, 140), n(784.0, 120, 240)];
++const COPY: &[Note] = &[n(1000.0, 0, 50), n(1500.0, 60, 70)];
++const BLUETOOTH: &[Note] = &[n(659.0, 0, 140), n(880.0, 120, 220)];
++
++// Alarm tones (also used for reminders).
++const CHIME: &[Note] = &[n(523.0, 0, 380), n(659.0, 160, 380), n(784.0, 320, 380), n(1047.0, 480, 520)];
++const BEEP: &[Note] = &[n(880.0, 0, 130), n(880.0, 200, 130), n(880.0, 400, 130)];
++const BELL: &[Note] = &[n(880.0, 0, 1100), ng(1760.0, 0, 600, 0.4), ng(2217.0, 0, 350, 0.2)];
++
++/// The note table for a sound (`tone` only matters for `Alarm` / `Reminder`).
++pub fn recipe(sound: Sound, tone: AlarmTone) -> &'static [Note] {
++    match sound {
++        Sound::Tick => TICK,
++        Sound::Open => OPEN,
++        Sound::Close => CLOSE,
++        Sound::Notify => NOTIFY,
++        Sound::Power => POWER,
++        Sound::Copy => COPY,
++        Sound::Bluetooth => BLUETOOTH,
++        Sound::Alarm | Sound::Reminder => match tone {
++            AlarmTone::Beep => BEEP,
++            AlarmTone::Bell => BELL,
++            AlarmTone::Chime | AlarmTone::Off => CHIME,
++        },
++    }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Wave {
++    Sine,
++    Triangle,
++    Square,
++}
++
++/// (waveform, loudness) of a pack. Square waves are harsh, hence the lower gain.
++fn pack_style(p: SoundPack) -> (Wave, f32) {
++    match p {
++        SoundPack::Soft => (Wave::Sine, 1.0),
++        SoundPack::Glass => (Wave::Triangle, 0.9),
++        SoundPack::Retro => (Wave::Square, 0.35),
++    }
++}
++
++/// Pause between repeats of the alarm.
++const REPEAT_GAP_MS: u32 = 350;
++/// How long `alarm_repeat = loop` keeps going without a click.
++const LOOP_MS: u32 = 30_000;
++/// Upper bound for a user file after repeating (bytes).
++const MAX_WAV: usize = 8 * 1024 * 1024;
++const MAX_USER_FILE: u64 = 4 * 1024 * 1024;
++
++// -------------------------------------------------------------------------------- synthesis
++
++pub const RATE: u32 = 22_050;
++const ATTACK_S: f32 = 0.006;
++
++fn osc(w: Wave, phase: f32) -> f32 {
++    match w {
++        Wave::Sine => (phase * std::f32::consts::TAU).sin(),
++        Wave::Triangle => 1.0 - 4.0 * (phase - 0.5).abs(),
++        Wave::Square => {
++            if phase < 0.5 {
++                1.0
++            } else {
++                -1.0
++            }
++        }
++    }
++}
++
++/// Mix a note table into mono 16-bit samples. `volume` is 0-100.
++pub fn synth(notes: &[Note], pack: SoundPack, volume: u32) -> Vec<i16> {
++    let (wave, pack_gain) = pack_style(pack);
++    let amp = 0.55 * pack_gain * (volume.min(100) as f32 / 100.0);
++    let end_ms = notes.iter().map(|x| x.at_ms + x.len_ms).max().unwrap_or(0) + 20;
++    let total = (RATE as u64 * end_ms as u64 / 1000) as usize;
++    let mut mix = vec![0f32; total];
++    for note in notes {
++        let start = (RATE as u64 * note.at_ms as u64 / 1000) as usize;
++        let len = (RATE as u64 * note.len_ms as u64 / 1000) as usize;
++        let step = note.hz / RATE as f32;
++        let mut phase = 0.0f32;
++        for i in 0..len {
++            let Some(slot) = mix.get_mut(start + i) else { break };
++            let t = i as f32 / RATE as f32;
++            let x = i as f32 / len as f32;
++            let env = (t / ATTACK_S).min(1.0) * (1.0 - x) * (1.0 - x);
++            *slot += osc(wave, phase) * env * note.gain;
++            phase += step;
++            if phase >= 1.0 {
++                phase -= 1.0;
++            }
++        }
++    }
++    // Several partials can add up past full scale: scale the whole clip down instead of clipping.
++    let peak = mix.iter().fold(0.0f32, |m, v| m.max(v.abs()));
++    let norm = if peak > 1.0 { 1.0 / peak } else { 1.0 };
++    mix.iter().map(|&v| ((v * norm * amp).clamp(-1.0, 1.0) * 32767.0) as i16).collect()
++}
++
++fn wav_header(fmt: &[u8; 16], data_len: usize) -> Vec<u8> {
++    let mut h = Vec::with_capacity(44);
++    h.extend_from_slice(b"RIFF");
++    h.extend_from_slice(&((36 + data_len) as u32).to_le_bytes());
++    h.extend_from_slice(b"WAVEfmt ");
++    h.extend_from_slice(&16u32.to_le_bytes());
++    h.extend_from_slice(fmt);
++    h.extend_from_slice(b"data");
++    h.extend_from_slice(&(data_len as u32).to_le_bytes());
++    h
++}
++
++/// A complete WAV file (mono, 16-bit) for these samples.
++pub fn wav_from_samples(samples: &[i16]) -> Vec<u8> {
++    let mut fmt = [0u8; 16];
++    fmt[0..2].copy_from_slice(&1u16.to_le_bytes()); // PCM
++    fmt[2..4].copy_from_slice(&1u16.to_le_bytes()); // mono
++    fmt[4..8].copy_from_slice(&RATE.to_le_bytes());
++    fmt[8..12].copy_from_slice(&(RATE * 2).to_le_bytes()); // byte rate
++    fmt[12..14].copy_from_slice(&2u16.to_le_bytes()); // block align
++    fmt[14..16].copy_from_slice(&16u16.to_le_bytes());
++    let mut out = wav_header(&fmt, samples.len() * 2);
++    for s in samples {
++        out.extend_from_slice(&s.to_le_bytes());
++    }
++    out
++}
++
++// ------------------------------------------------------------------------- WAV handling (user files)
++
++struct Wav {
++    channels: u16,
++    rate: u32,
++    bits: u16,
++    fmt: [u8; 16],
++    data: std::ops::Range<usize>,
++}
++
++/// Only plain PCM, 8 or 16 bit, mono or stereo. Anything else still plays, but cannot be
++/// scaled or repeated.
++fn parse_wav(b: &[u8]) -> Option<Wav> {
++    if b.len() < 44 || &b[0..4] != b"RIFF" || &b[8..12] != b"WAVE" {
++        return None;
++    }
++    let mut pos = 12usize;
++    let mut fmt: Option<([u8; 16], u16, u32, u16)> = None;
++    while pos + 8 <= b.len() {
++        let id = &b[pos..pos + 4];
++        let size = u32::from_le_bytes(b[pos + 4..pos + 8].try_into().ok()?) as usize;
++        let body = pos + 8;
++        let end = body.checked_add(size)?.min(b.len());
++        if id == b"fmt " && end - body >= 16 {
++            let f: [u8; 16] = b[body..body + 16].try_into().ok()?;
++            let tag = u16::from_le_bytes([f[0], f[1]]);
++            let ch = u16::from_le_bytes([f[2], f[3]]);
++            let rate = u32::from_le_bytes([f[4], f[5], f[6], f[7]]);
++            let bits = u16::from_le_bytes([f[14], f[15]]);
++            if tag != 1 || !(1..=2).contains(&ch) || rate == 0 || !(bits == 8 || bits == 16) {
++                return None;
++            }
++            fmt = Some((f, ch, rate, bits));
++        } else if id == b"data" {
++            let (f, channels, rate, bits) = fmt?;
++            return Some(Wav { channels, rate, bits, fmt: f, data: body..end });
++        }
++        pos = body.checked_add(size)?.checked_add(size & 1)?;
++    }
++    None
++}
++
++/// Length of a (parseable) WAV in milliseconds.
++pub fn duration_ms(b: &[u8]) -> Option<u64> {
++    let w = parse_wav(b)?;
++    let block = (w.bits as u64 / 8) * w.channels as u64;
++    Some(w.data.len() as u64 * 1000 / (w.rate as u64 * block))
++}
++
++/// Scale the loudness of a WAV (`gain` 0..1). Unsupported formats come back unchanged.
++pub fn scale_wav(b: &[u8], gain: f32) -> Vec<u8> {
++    let mut out = b.to_vec();
++    if gain >= 0.999 {
++        return out;
++    }
++    let Some(w) = parse_wav(b) else { return out };
++    let data = &mut out[w.data.clone()];
++    if w.bits == 16 {
++        for c in data.chunks_exact_mut(2) {
++            let v = (i16::from_le_bytes([c[0], c[1]]) as f32 * gain) as i16;
++            c.copy_from_slice(&v.to_le_bytes());
++        }
++    } else {
++        for s in data.iter_mut() {
++            *s = (((*s as f32 - 128.0) * gain) + 128.0).clamp(0.0, 255.0) as u8;
++        }
++    }
++    out
++}
++
++/// `times` copies of the clip with `gap_ms` of silence between them.
++pub fn repeat_wav(b: &[u8], times: u32, gap_ms: u32) -> Option<Vec<u8>> {
++    let w = parse_wav(b)?;
++    let block = (w.bits as usize / 8) * w.channels as usize;
++    let clip = &b[w.data.clone()];
++    let clip = &clip[..clip.len() / block * block];
++    let gap = (w.rate as u64 * gap_ms as u64 / 1000) as usize * block;
++    let times = times.max(1) as usize;
++    let total = (clip.len() + gap) * times;
++    if total > MAX_WAV {
++        return None;
++    }
++    let silence = if w.bits == 8 { 0x80 } else { 0u8 };
++    let mut data = Vec::with_capacity(total);
++    for i in 0..times {
++        data.extend_from_slice(clip);
++        if i + 1 < times {
++            data.extend(std::iter::repeat(silence).take(gap));
++        }
++    }
++    let mut out = wav_header(&w.fmt, data.len());
++    out.extend_from_slice(&data);
++    Some(out)
++}
++
++// ------------------------------------------------------------------------------------- the bank
++
++/// Every sound, ready to play, plus the long (repeated) version of the alarm.
++pub struct Bank {
++    clips: Vec<Option<Vec<u8>>>,
++    alarm_long: Option<Vec<u8>>,
++}
++
++impl Bank {
++    fn empty() -> Bank {
++        Bank { clips: vec![None; Sound::ALL.len()], alarm_long: None }
++    }
++}
++
++/// Build all sounds for this config. `custom` returns the user's override file for a sound, if any.
++pub fn build(cfg: &Config, custom: &dyn Fn(Sound) -> Option<Vec<u8>>) -> Bank {
++    let vol = cfg.sound_volume.min(100);
++    let mut bank = Bank::empty();
++    for s in Sound::ALL {
++        let user = custom(s).or_else(|| if s == Sound::Reminder { custom(Sound::Alarm) } else { None });
++        let bytes = match user {
++            Some(raw) => scale_wav(&raw, vol as f32 / 100.0),
++            None => wav_from_samples(&synth(recipe(s, cfg.alarm_tone), cfg.sound_pack, vol)),
++        };
++        bank.clips[s.idx()] = Some(bytes);
++    }
++    bank.alarm_long = bank.clips[Sound::Alarm.idx()].as_ref().and_then(|one| match cfg.alarm_repeat {
++        AlarmRepeat::Once => None,
++        AlarmRepeat::Three => repeat_wav(one, 3, REPEAT_GAP_MS),
++        AlarmRepeat::Loop => {
++            let dur = duration_ms(one)? as u32 + REPEAT_GAP_MS;
++            repeat_wav(one, (LOOP_MS / dur.max(1)).clamp(2, 60), REPEAT_GAP_MS)
++        }
++    });
++    bank
++}
++
++fn read_user_file(s: Sound) -> Option<Vec<u8>> {
++    let path = crate::config::sounds_dir()?.join(format!("{}.wav", s.stem()));
++    let meta = std::fs::metadata(&path).ok()?;
++    if !meta.is_file() || meta.len() > MAX_USER_FILE {
++        return None;
++    }
++    let bytes = std::fs::read(path).ok()?;
++    // Must at least look like a WAV; otherwise ignore it and use the generated sound.
++    (bytes.len() > 12 && &bytes[0..4] == b"RIFF").then_some(bytes)
++}
++
++/// Creates the sounds folder (with a short README) and returns its path.
++pub fn prepare_folder() -> Option<PathBuf> {
++    let dir = crate::config::sounds_dir()?;
++    std::fs::create_dir_all(&dir).ok()?;
++    let readme = dir.join("README.txt");
++    if !readme.exists() {
++        let mut text = String::from(
++            "Put your own sounds here. A file with one of these names replaces the built-in sound:\r\n\r\n",
++        );
++        for s in Sound::ALL {
++            text.push_str(&format!("  {}.wav\r\n", s.stem()));
++        }
++        text.push_str(
++            "\r\n\
++             - Format: WAV, 8 or 16 bit PCM, mono or stereo, up to 4 MB. Keep them short.\r\n\
++             - alarm.wav is repeated automatically (Settings > Sounds > Alarm repeat).\r\n\
++             - reminder.wav is optional; without it a reminder plays alarm.wav once.\r\n\
++             - The volume setting also applies to your files.\r\n\
++             - Delete a file to go back to the built-in sound.\r\n\
++             - After adding or removing files: tray menu > Reload config.\r\n",
++        );
++        let _ = std::fs::write(readme, text);
++    }
++    Some(dir)
++}
++
++// ------------------------------------------------------------------------------------- playback
++
++pub struct Sounds {
++    bank: Bank,
++    enabled: bool,
++    ui: bool,
++    events: u8,
++    alarm_on: bool,
++    /// While an alarm rings, small sounds stay quiet so they do not cut it off.
++    busy_until: Option<Instant>,
++}
++
++impl Sounds {
++    pub fn new(cfg: &Config) -> Sounds {
++        let mut s = Sounds { bank: Bank::empty(), enabled: false, ui: false, events: 0, alarm_on: false, busy_until: None };
++        s.rebuild(cfg);
++        s
++    }
++
++    /// Re-read the config and the sounds folder. Costs a few milliseconds, nothing while idle.
++    pub fn rebuild(&mut self, cfg: &Config) {
++        self.stop();
++        raw_stop(); // the old buffers are about to be freed
++        self.enabled = cfg.sounds;
++        self.ui = cfg.ui_sounds;
++        self.events = cfg.sound_events;
++        self.alarm_on = cfg.alarm_tone != AlarmTone::Off;
++        // Nothing is built while sounds are off, so a silent island holds no audio memory.
++        self.bank = if cfg.sounds { build(cfg, &read_user_file) } else { Bank::empty() };
++    }
++
++    /// Tick / Open / Close: only with "UI sounds" on.
++    pub fn ui(&mut self, s: Sound, now: Instant) {
++        if self.ui {
++            self.play(s, now, false);
++        }
++    }
++
++    /// Event sounds, gated by their bit in `sound_events` (`config::sev`).
++    pub fn event(&mut self, bit: u8, s: Sound, now: Instant) {
++        if self.events & bit != 0 {
++            self.play(s, now, false);
++        }
++    }
++
++    /// Settings feedback: plays regardless of the per-category switches (only the master counts).
++    pub fn preview(&mut self, s: Sound, now: Instant) {
++        self.play(s, now, true);
++    }
++
++    /// Timer finished: the alarm with its repeat setting.
++    pub fn alarm(&mut self, now: Instant) {
++        if !self.enabled || !self.alarm_on {
++            return;
++        }
++        // The repeated version (3x / loop) if there is one, else the single alarm.
++        if let Some(b) = self.bank.alarm_long.as_ref().or(self.bank.clips[Sound::Alarm.idx()].as_ref()) {
++            raw_play(b);
++            self.busy_until = Some(now + Duration::from_millis(duration_ms(b).unwrap_or(0)));
++        }
++    }
++
++    /// A reminder came due: one play of the alarm tone.
++    pub fn reminder(&mut self, now: Instant) {
++        if self.enabled && self.alarm_on {
++            self.play(Sound::Reminder, now, true);
++        }
++    }
++
++    /// Settings preview of the chosen alarm tone: a single play.
++    pub fn preview_alarm(&mut self, now: Instant) {
++        if self.alarm_on {
++            self.play(Sound::Alarm, now, true);
++        }
++    }
++
++    /// Silence a ringing alarm (called when you click or open the island).
++    pub fn stop(&mut self) {
++        if self.busy_until.take().is_some() {
++            raw_stop();
++        }
++    }
++
++    fn play(&mut self, s: Sound, now: Instant, force: bool) {
++        if !self.enabled {
++            return;
++        }
++        if !force && self.busy_until.is_some_and(|t| now < t) {
++            return;
++        }
++        if let Some(b) = &self.bank.clips[s.idx()] {
++            raw_play(b);
++            self.busy_until = match s {
++                Sound::Alarm | Sound::Reminder => Some(now + Duration::from_millis(duration_ms(b).unwrap_or(0))),
++                _ => None,
++            };
++        }
++    }
++}
++
++impl Drop for Sounds {
++    fn drop(&mut self) {
++        raw_stop();
++    }
++}
++
++#[cfg(windows)]
++fn raw_play(wav: &[u8]) {
++    use crate::ffi::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
++    // SND_MEMORY + SND_ASYNC: the buffer must outlive playback, and it does: the bank is only
++    // replaced after `raw_stop()` (see `rebuild`).
++    unsafe {
++        PlaySoundW(wav.as_ptr().cast(), 0, SND_ASYNC | SND_MEMORY | SND_NODEFAULT);
++    }
++}
++
++#[cfg(windows)]
++fn raw_stop() {
++    unsafe {
++        crate::ffi::PlaySoundW(std::ptr::null(), 0, 0);
++    }
++}
++
++#[cfg(not(windows))]
++fn raw_play(_wav: &[u8]) {}
++
++#[cfg(not(windows))]
++fn raw_stop() {}
++
++/// Did any setting that changes the sounds themselves (or when they play) change?
++pub fn config_differs(a: &Config, b: &Config) -> bool {
++    a.sounds != b.sounds
++        || a.sound_volume != b.sound_volume
++        || a.sound_pack != b.sound_pack
++        || a.ui_sounds != b.ui_sounds
++        || a.sound_events != b.sound_events
++        || a.alarm_tone != b.alarm_tone
++        || a.alarm_repeat != b.alarm_repeat
++}
++
++/// Is this one of the sounds that belongs to the "event sounds" chips? (bit, sound), chip order.
++pub const EVENT_SOUNDS: [(u8, Sound); 4] = [
++    (sev::NOTIFY, Sound::Notify),
++    (sev::POWER, Sound::Power),
++    (sev::COPY, Sound::Copy),
++    (sev::BLUETOOTH, Sound::Bluetooth),
++];
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn none(_: Sound) -> Option<Vec<u8>> {
++        None
++    }
++
++    #[test]
++    fn stems_are_unique_and_ordered_like_the_enum() {
++        for (i, s) in Sound::ALL.iter().enumerate() {
++            assert_eq!(s.idx(), i);
++            for t in Sound::ALL.iter().skip(i + 1) {
++                assert_ne!(s.stem(), t.stem());
++            }
++        }
++    }
++
++    #[test]
++    fn recipes_are_sane() {
++        for s in Sound::ALL {
++            for tone in [AlarmTone::Chime, AlarmTone::Beep, AlarmTone::Bell] {
++                let r = recipe(s, tone);
++                assert!(!r.is_empty());
++                for note in r {
++                    assert!(note.hz >= 100.0 && note.hz < RATE as f32 / 2.0, "{s:?} {}", note.hz);
++                    assert!(note.at_ms + note.len_ms <= 2000);
++                    assert!(note.gain > 0.0 && note.gain <= 1.0);
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn synth_is_audible_bounded_and_scales_with_volume() {
++        for pack in [SoundPack::Soft, SoundPack::Glass, SoundPack::Retro] {
++            for tone in [AlarmTone::Chime, AlarmTone::Beep, AlarmTone::Bell] {
++                let loud = synth(recipe(Sound::Alarm, tone), pack, 100);
++                let soft = synth(recipe(Sound::Alarm, tone), pack, 30);
++                let peak = |v: &[i16]| v.iter().map(|x| (*x as i32).abs()).max().unwrap();
++                assert!(peak(&loud) > 3000, "{pack:?} {tone:?}");
++                assert!(peak(&loud) < 32767);
++                assert!(peak(&soft) < peak(&loud));
++            }
++        }
++        assert!(synth(TICK, SoundPack::Soft, 0).iter().all(|&x| x == 0));
++        // no click at the very end
++        let t = synth(TICK, SoundPack::Retro, 100);
++        assert!(t[t.len() - 1].abs() < 100);
++    }
++
++    #[test]
++    fn generated_wav_parses_back() {
++        let samples = synth(NOTIFY, SoundPack::Soft, 60);
++        let wav = wav_from_samples(&samples);
++        let w = parse_wav(&wav).expect("valid wav");
++        assert_eq!((w.channels, w.rate, w.bits), (1, RATE, 16));
++        assert_eq!(w.data.len(), samples.len() * 2);
++        let ms = duration_ms(&wav).unwrap();
++        assert!((350..=420).contains(&ms), "{ms}");
++    }
++
++    #[test]
++    fn rejects_garbage_and_unsupported_formats() {
++        assert!(parse_wav(b"not a wav at all, definitely not a wav file at all....").is_none());
++        let mut wav = wav_from_samples(&[0i16; 100]);
++        wav[20] = 3; // float format
++        assert!(parse_wav(&wav).is_none());
++        assert_eq!(scale_wav(&wav, 0.5), wav); // unchanged, still playable
++    }
++
++    #[test]
++    fn scale_halves_samples() {
++        let wav = wav_from_samples(&[1000, -2000, 30000]);
++        let half = scale_wav(&wav, 0.5);
++        let w = parse_wav(&half).unwrap();
++        let v: Vec<i16> = half[w.data].chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
++        assert_eq!(v, vec![500, -1000, 15000]);
++        assert_eq!(scale_wav(&wav, 1.0), wav);
++    }
++
++    #[test]
++    fn repeat_adds_gaps_between_copies_only() {
++        let one = wav_from_samples(&vec![100i16; RATE as usize / 10]); // 100 ms
++        let three = repeat_wav(&one, 3, 200).unwrap();
++        let ms = duration_ms(&three).unwrap();
++        assert!((ms as i64 - 700).abs() <= 2, "{ms}"); // 3 x 100 + 2 x 200
++        assert!(parse_wav(&three).is_some());
++        assert_eq!(duration_ms(&repeat_wav(&one, 1, 200).unwrap()), duration_ms(&one));
++    }
++
++    #[test]
++    fn repeat_refuses_absurd_sizes() {
++        let one = wav_from_samples(&vec![1i16; RATE as usize * 5]);
++        assert!(repeat_wav(&one, 60, 350).is_none());
++    }
++
++    #[test]
++    fn build_makes_every_sound_and_alarm_repeats() {
++        let mut cfg = Config::default();
++        for rep in [AlarmRepeat::Once, AlarmRepeat::Three, AlarmRepeat::Loop] {
++            cfg.alarm_repeat = rep;
++            let bank = build(&cfg, &none);
++            assert!(bank.clips.iter().all(|c| c.is_some()));
++            let one = duration_ms(bank.clips[Sound::Alarm.idx()].as_ref().unwrap()).unwrap();
++            match rep {
++                AlarmRepeat::Once => assert!(bank.alarm_long.is_none()),
++                AlarmRepeat::Three => {
++                    let l = duration_ms(bank.alarm_long.as_ref().unwrap()).unwrap();
++                    assert!(l > one * 2);
++                }
++                AlarmRepeat::Loop => {
++                    let l = duration_ms(bank.alarm_long.as_ref().unwrap()).unwrap();
++                    assert!((20_000..=32_000).contains(&l), "{l}");
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn user_files_override_and_reminder_falls_back_to_alarm() {
++        let mine = wav_from_samples(&vec![5000i16; RATE as usize / 2]); // 500 ms
++        let only_alarm = |s: Sound| (s == Sound::Alarm).then(|| mine.clone());
++        let cfg = Config { sound_volume: 100, alarm_repeat: AlarmRepeat::Once, ..Config::default() };
++        let bank = build(&cfg, &only_alarm);
++        assert_eq!(bank.clips[Sound::Alarm.idx()].as_ref().unwrap(), &mine);
++        assert_eq!(bank.clips[Sound::Reminder.idx()].as_ref().unwrap(), &mine);
++        // other sounds stay generated
++        assert_ne!(bank.clips[Sound::Tick.idx()].as_ref().unwrap(), &mine);
++    }
++
++    #[test]
++    fn user_files_follow_the_volume_setting() {
++        let mine = wav_from_samples(&[10000, -10000]);
++        let all = |_: Sound| Some(mine.clone());
++        let cfg = Config { sound_volume: 50, ..Config::default() };
++        let bank = build(&cfg, &all);
++        let b = bank.clips[Sound::Tick.idx()].as_ref().unwrap();
++        let w = parse_wav(b).unwrap();
++        assert_eq!(i16::from_le_bytes([b[w.data.start], b[w.data.start + 1]]), 5000);
++    }
++
++    #[test]
++    fn gating_follows_the_switches() {
++        let now = Instant::now();
++        let mut cfg = Config::default();
++        cfg.sounds = false;
++        let mut s = Sounds::new(&cfg);
++        s.alarm(now);
++        assert!(s.busy_until.is_none()); // master switch off: nothing plays
++        cfg.sounds = true;
++        cfg.ui_sounds = false;
++        s.rebuild(&cfg);
++        s.alarm(now);
++        assert!(s.busy_until.is_some()); // alarm is independent of UI sounds
++        s.stop();
++        assert!(s.busy_until.is_none());
++        cfg.alarm_tone = AlarmTone::Off;
++        s.rebuild(&cfg);
++        s.alarm(now);
++        assert!(s.busy_until.is_none());
++        s.reminder(now);
++        assert!(s.busy_until.is_none());
++    }
++
++    #[test]
++    fn small_sounds_do_not_cut_a_ringing_alarm() {
++        let now = Instant::now();
++        let cfg = Config::default();
++        let mut s = Sounds::new(&cfg);
++        s.alarm(now);
++        let until = s.busy_until.unwrap();
++        s.ui(Sound::Tick, now + Duration::from_millis(10));
++        assert_eq!(s.busy_until, Some(until));
++        s.rebuild(&cfg);
++        assert!(s.busy_until.is_none());
++    }
++
++    #[test]
++    fn config_differs_sees_every_sound_field() {
++        let base = Config::default();
++        assert!(!config_differs(&base, &base.clone()));
++        let variants = [
++            Config { sounds: !base.sounds, ..base.clone() },
++            Config { sound_volume: 10, ..base.clone() },
++            Config { sound_pack: SoundPack::Retro, ..base.clone() },
++            Config { ui_sounds: !base.ui_sounds, ..base.clone() },
++            Config { sound_events: 0, ..base.clone() },
++            Config { alarm_tone: AlarmTone::Bell, ..base.clone() },
++            Config { alarm_repeat: AlarmRepeat::Loop, ..base.clone() },
++        ];
++        for v in variants {
++            assert!(config_differs(&base, &v));
++        }
++        // unrelated settings do not trigger a rebuild
++        assert!(!config_differs(&base, &Config { hover_delay_ms: 5, ..base.clone() }));
++    }
++
++    #[test]
++    fn event_chips_match_config_bits() {
++        let all = EVENT_SOUNDS.iter().fold(0, |a, (b, _)| a | b);
++        assert_eq!(all, sev::ALL);
++    }
++}
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' orig/src/ui.rs src/src/ui.rs
+--- a/src/ui.rs	2026-11-25 21:38:03.386821499 +0100
++++ b/src/ui.rs	2026-11-25 21:43:37.926267607 +0100
+@@ -116,6 +116,8 @@
+     pub scroll: f32,
+     /// Settings scroll position in rows.
+     pub sscroll: f32,
++    /// Which category the Settings tab shows (`None` = the home page with the category cards).
++    pub scat: Option<settings::Cat>,
+     pub autostart: bool,
+     /// 1 -> 0 fade of the "Saved" note after a settings change.
+     pub saved: f32,
+@@ -669,9 +671,20 @@
+         let al = if sc.hover == Hit::Clear { 0.9 } else { 0.55 };
+         cv.text(label, g.clear.x + 4.0, g.clear.y + 16.0, 11.5, Weight::Semibold, sc.accent, al * timer_vis * a);
+     }
++    // Settings: "Back" inside a category (it flashes in the accent colour after a change, which
++    // replaces the old "Saved" note), the "Saved" note on the home page.
+     let set_vis = 1.0 - (sc.tab_pos - 4.0).abs().min(1.0);
+-    if set_vis > 0.01 && sc.saved > 0.01 {
+-        cv.text("Saved", g.clear.x + 4.0, g.clear.y + 16.0, 11.5, Weight::Semibold, sc.accent, sc.saved * set_vis * a);
++    if set_vis > 0.01 {
++        if sc.scat.is_some() {
++            let hov = sc.hover == Hit::Back;
++            cv.fill_rrect(g.clear, 12.0, white((if hov { 0.20 } else { 0.10 }) * set_vis * a));
++            if sc.saved > 0.01 {
++                cv.fill_rrect(g.clear, 12.0, rgba(sc.accent, 0.30 * sc.saved * set_vis * a));
++            }
++            cv.text_centered("\u{2039} Back", g.clear.cx(), g.clear.y + 16.0, 11.5, Weight::Semibold, WHITE, 0.9 * set_vis * a);
++        } else if sc.saved > 0.01 {
++            cv.text("Saved", g.clear.x + 4.0, g.clear.y + 16.0, 11.5, Weight::Semibold, sc.accent, sc.saved * set_vis * a);
++        }
+     }
+ 
+     // Pages: neighbours slide and cross-fade while the highlight moves.
+@@ -1167,8 +1180,61 @@
+     }
+ }
+ 
+-// ----------------------------------------------------------------- settings// ----------------------------------------------------------------- settings
++// ----------------------------------------------------------------- settings
++/// Settings has two levels: the home page (one card per category) and a category page.
+ fn page_settings(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
++    let page = settings::Page::new(sc.scat, sc.cfg);
++    match sc.scat {
++        None => settings_home(cv, sc, ox, a),
++        Some(k) if k.is_grid() => settings_grid(cv, sc, &page, ox, a),
++        Some(_) => settings_list(cv, sc, &page, ox, a),
++    }
++}
++
++/// Home page: six category cards with a live one-line summary each.
++fn settings_home(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
++    let c = sc.geo.content;
++    for (i, cat) in settings::Cat::ALL.iter().enumerate() {
++        let mut r = settings::card_rect(c, i);
++        r.x += ox;
++        let hov = matches!(sc.hover, Hit::Cat(j) if j as usize == i);
++        cv.fill_rrect(r, 14.0, white((if hov { 0.13 } else { 0.07 }) * a));
++        cv.clip_rect(r);
++        cv.fill_rrect(Rect::new(r.x + 10.0, r.y + 8.0, 16.0, 16.0), 5.0, rgba(sc.accent, 0.9 * a));
++        cv.text("\u{203a}", r.right() - 16.0, r.y + 20.0, 15.0, Weight::Regular, WHITE, (if hov { 0.7 } else { 0.35 }) * a);
++        cv.text(cat.title(), r.x + 10.0, r.y + 36.0, 12.5, Weight::Semibold, WHITE, 0.95 * a);
++        cv.text(&settings::summary(*cat, sc.cfg), r.x + 10.0, r.y + 47.5, 10.5, Weight::Regular, WHITE, 0.5 * a);
++        cv.unclip_rect();
++    }
++}
++
++/// Peeks: every switch as a compact chip in a 3-column grid.
++fn settings_grid(cv: &mut Canvas, sc: &Scene, page: &settings::Page, ox: f32, a: f32) {
++    let c = sc.geo.content;
++    let view = settings::View { cfg: sc.cfg, autostart: sc.autostart };
++    for (i, &id) in page.rows.as_slice().iter().enumerate() {
++        let mut r = settings::grid_rect(c, i);
++        r.x += ox;
++        let on = settings::toggle_on(id, &view);
++        let hov = matches!(sc.hover, Hit::Set(j, _) if j == i);
++        if on {
++            cv.fill_rrect(r, 11.0, rgba(sc.accent, (if hov { 0.30 } else { 0.20 }) * a));
++        } else {
++            cv.fill_rrect(r, 11.0, white((if hov { 0.12 } else { 0.07 }) * a));
++        }
++        cv.text(settings::grid_label(id), r.x + 9.0, r.y + 21.0, 11.5, Weight::Regular, WHITE, (if on { 1.0 } else { 0.6 }) * a);
++        let (dx, dy) = (r.right() - 14.0, r.cy());
++        if on {
++            cv.fill_circle(dx, dy, 6.5, rgba(sc.accent, 0.22 * a));
++            cv.fill_circle(dx, dy, 3.5, rgba(sc.accent, a));
++        } else {
++            cv.fill_circle(dx, dy, 3.5, white(0.22 * a));
++        }
++    }
++}
++
++/// A category page: its rows, one per line (scrolls when there are more than four).
++fn settings_list(cv: &mut Canvas, sc: &Scene, page: &settings::Page, ox: f32, a: f32) {
+     let g = sc.geo;
+     let c = g.content;
+     let view = settings::View { cfg: sc.cfg, autostart: sc.autostart };
+@@ -1176,9 +1242,9 @@
+ 
+     cv.clip_rect(Rect::new(c.x - 8.0, c.y, c.w + 16.0, c.h));
+     let first = sc.sscroll.floor().max(0.0) as usize;
+-    let last = (first + VISIBLE_ROWS + 1).min(settings::ROWS.len());
++    let last = (first + VISIBLE_ROWS + 1).min(page.rows.len());
+     for i in first..last {
+-        let row = &settings::ROWS[i];
++        let row = settings::row(page.rows.as_slice()[i]);
+         let y = c.y + (i as f32 - sc.sscroll) * ROW_H;
+         let hov_row = matches!(sc.hover, Hit::Set(j, _) if j == i);
+         if hov_row && row.ctl == Ctl::Toggle {
+@@ -1279,9 +1345,10 @@
+         }
+     }
+     cv.unclip_rect();
+-    scroll_thumb(cv, c, settings::ROWS.len(), VISIBLE_ROWS, sc.sscroll, ox, a);
++    scroll_thumb(cv, c, page.rows.len(), VISIBLE_ROWS, sc.sscroll, ox, a);
+ }
+ 
++
+ // -------------------------------------------------------------------- icons
+ fn tri(cv: &mut Canvas, pts: &[(f32, f32)], col: Color) {
+     if let Some(p) = gfx::poly(pts) {

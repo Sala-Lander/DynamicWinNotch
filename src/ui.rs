@@ -116,6 +116,8 @@ pub struct Scene<'a> {
     pub scroll: f32,
     /// Settings scroll position in rows.
     pub sscroll: f32,
+    /// Which category the Settings tab shows (`None` = the home page with the category cards).
+    pub scat: Option<settings::Cat>,
     pub autostart: bool,
     /// 1 -> 0 fade of the "Saved" note after a settings change.
     pub saved: f32,
@@ -669,9 +671,20 @@ fn draw_expanded(cv: &mut Canvas, sc: &Scene, a: f32) -> bool {
         let al = if sc.hover == Hit::Clear { 0.9 } else { 0.55 };
         cv.text(label, g.clear.x + 4.0, g.clear.y + 16.0, 11.5, Weight::Semibold, sc.accent, al * timer_vis * a);
     }
+    // Settings: "Back" inside a category (it flashes in the accent colour after a change, which
+    // replaces the old "Saved" note), the "Saved" note on the home page.
     let set_vis = 1.0 - (sc.tab_pos - 4.0).abs().min(1.0);
-    if set_vis > 0.01 && sc.saved > 0.01 {
-        cv.text("Saved", g.clear.x + 4.0, g.clear.y + 16.0, 11.5, Weight::Semibold, sc.accent, sc.saved * set_vis * a);
+    if set_vis > 0.01 {
+        if sc.scat.is_some() {
+            let hov = sc.hover == Hit::Back;
+            cv.fill_rrect(g.clear, 12.0, white((if hov { 0.20 } else { 0.10 }) * set_vis * a));
+            if sc.saved > 0.01 {
+                cv.fill_rrect(g.clear, 12.0, rgba(sc.accent, 0.30 * sc.saved * set_vis * a));
+            }
+            cv.text_centered("\u{2039} Back", g.clear.cx(), g.clear.y + 16.0, 11.5, Weight::Semibold, WHITE, 0.9 * set_vis * a);
+        } else if sc.saved > 0.01 {
+            cv.text("Saved", g.clear.x + 4.0, g.clear.y + 16.0, 11.5, Weight::Semibold, sc.accent, sc.saved * set_vis * a);
+        }
     }
 
     // Pages: neighbours slide and cross-fade while the highlight moves.
@@ -1167,8 +1180,61 @@ fn page_timer(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
     }
 }
 
-// ----------------------------------------------------------------- settings// ----------------------------------------------------------------- settings
+// ----------------------------------------------------------------- settings
+/// Settings has two levels: the home page (one card per category) and a category page.
 fn page_settings(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
+    let page = settings::Page::new(sc.scat, sc.cfg);
+    match sc.scat {
+        None => settings_home(cv, sc, ox, a),
+        Some(k) if k.is_grid() => settings_grid(cv, sc, &page, ox, a),
+        Some(_) => settings_list(cv, sc, &page, ox, a),
+    }
+}
+
+/// Home page: six category cards with a live one-line summary each.
+fn settings_home(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
+    let c = sc.geo.content;
+    for (i, cat) in settings::Cat::ALL.iter().enumerate() {
+        let mut r = settings::card_rect(c, i);
+        r.x += ox;
+        let hov = matches!(sc.hover, Hit::Cat(j) if j as usize == i);
+        cv.fill_rrect(r, 14.0, white((if hov { 0.13 } else { 0.07 }) * a));
+        cv.clip_rect(r);
+        cv.fill_rrect(Rect::new(r.x + 10.0, r.y + 8.0, 16.0, 16.0), 5.0, rgba(sc.accent, 0.9 * a));
+        cv.text("\u{203a}", r.right() - 16.0, r.y + 20.0, 15.0, Weight::Regular, WHITE, (if hov { 0.7 } else { 0.35 }) * a);
+        cv.text(cat.title(), r.x + 10.0, r.y + 36.0, 12.5, Weight::Semibold, WHITE, 0.95 * a);
+        cv.text(&settings::summary(*cat, sc.cfg), r.x + 10.0, r.y + 47.5, 10.5, Weight::Regular, WHITE, 0.5 * a);
+        cv.unclip_rect();
+    }
+}
+
+/// Peeks: every switch as a compact chip in a 3-column grid.
+fn settings_grid(cv: &mut Canvas, sc: &Scene, page: &settings::Page, ox: f32, a: f32) {
+    let c = sc.geo.content;
+    let view = settings::View { cfg: sc.cfg, autostart: sc.autostart };
+    for (i, &id) in page.rows.as_slice().iter().enumerate() {
+        let mut r = settings::grid_rect(c, i);
+        r.x += ox;
+        let on = settings::toggle_on(id, &view);
+        let hov = matches!(sc.hover, Hit::Set(j, _) if j == i);
+        if on {
+            cv.fill_rrect(r, 11.0, rgba(sc.accent, (if hov { 0.30 } else { 0.20 }) * a));
+        } else {
+            cv.fill_rrect(r, 11.0, white((if hov { 0.12 } else { 0.07 }) * a));
+        }
+        cv.text(settings::grid_label(id), r.x + 9.0, r.y + 21.0, 11.5, Weight::Regular, WHITE, (if on { 1.0 } else { 0.6 }) * a);
+        let (dx, dy) = (r.right() - 14.0, r.cy());
+        if on {
+            cv.fill_circle(dx, dy, 6.5, rgba(sc.accent, 0.22 * a));
+            cv.fill_circle(dx, dy, 3.5, rgba(sc.accent, a));
+        } else {
+            cv.fill_circle(dx, dy, 3.5, white(0.22 * a));
+        }
+    }
+}
+
+/// A category page: its rows, one per line (scrolls when there are more than four).
+fn settings_list(cv: &mut Canvas, sc: &Scene, page: &settings::Page, ox: f32, a: f32) {
     let g = sc.geo;
     let c = g.content;
     let view = settings::View { cfg: sc.cfg, autostart: sc.autostart };
@@ -1176,9 +1242,9 @@ fn page_settings(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
 
     cv.clip_rect(Rect::new(c.x - 8.0, c.y, c.w + 16.0, c.h));
     let first = sc.sscroll.floor().max(0.0) as usize;
-    let last = (first + VISIBLE_ROWS + 1).min(settings::ROWS.len());
+    let last = (first + VISIBLE_ROWS + 1).min(page.rows.len());
     for i in first..last {
-        let row = &settings::ROWS[i];
+        let row = settings::row(page.rows.as_slice()[i]);
         let y = c.y + (i as f32 - sc.sscroll) * ROW_H;
         let hov_row = matches!(sc.hover, Hit::Set(j, _) if j == i);
         if hov_row && row.ctl == Ctl::Toggle {
@@ -1279,8 +1345,9 @@ fn page_settings(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
         }
     }
     cv.unclip_rect();
-    scroll_thumb(cv, c, settings::ROWS.len(), VISIBLE_ROWS, sc.sscroll, ox, a);
+    scroll_thumb(cv, c, page.rows.len(), VISIBLE_ROWS, sc.sscroll, ox, a);
 }
+
 
 // -------------------------------------------------------------------- icons
 fn tri(cv: &mut Canvas, pts: &[(f32, f32)], col: Color) {

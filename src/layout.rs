@@ -250,8 +250,13 @@ pub enum Hit {
     /// Clipboard row: a position in the *currently displayed* (filtered) list, not necessarily
     /// an absolute index into the history - the caller maps it back using the same filter.
     Row(usize),
-    /// Settings control: (row index, sub-control index, see `settings::sub_rects`).
+    /// Settings control: (position in the current page's rows, sub-control index, see
+    /// `settings::sub_rects`).
     Set(usize, u8),
+    /// Settings home page: category card `i` (`settings::Cat::ALL`).
+    Cat(u8),
+    /// "Back" to the Settings home page (sits in the header's left slot).
+    Back,
     Preset(usize),
     TimerMinus,
     TimerToggle,
@@ -261,8 +266,9 @@ pub enum Hit {
     Search,
 }
 
-/// `scroll` is the clipboard scroll position in rows (fractional while animating).
-pub fn hit_test(g: &Geo, tab: Tab, x: f32, y: f32, scroll: f32, rows: usize) -> Hit {
+/// `scroll` is the clipboard / settings-list scroll position in rows (fractional while
+/// animating); `page` says what the Settings tab currently shows.
+pub fn hit_test(g: &Geo, tab: Tab, x: f32, y: f32, scroll: f32, rows: usize, page: &settings::Page) -> Hit {
     if !g.pill.contains(x, y) {
         return Hit::None;
     }
@@ -271,6 +277,9 @@ pub fn hit_test(g: &Geo, tab: Tab, x: f32, y: f32, scroll: f32, rows: usize) -> 
     }
     if matches!(tab, Tab::Clipboard | Tab::Timer) && g.clear.contains(x, y) {
         return Hit::Clear;
+    }
+    if tab == Tab::Settings && page.cat.is_some() && g.clear.contains(x, y) {
+        return Hit::Back;
     }
     for (i, t) in g.tabs.iter().enumerate() {
         if t.inflate_xy(2.0, 3.0).contains(x, y) {
@@ -304,18 +313,11 @@ pub fn hit_test(g: &Geo, tab: Tab, x: f32, y: f32, scroll: f32, rows: usize) -> 
                 }
             }
         }
-        Tab::Settings => {
-            if g.content.contains(x, y) {
-                let idx = (scroll + (y - g.content.y) / ROW_H).floor();
-                if idx >= 0.0 && (idx as usize) < rows.min(settings::ROWS.len()) {
-                    let i = idx as usize;
-                    let row_y = g.content.y + (i as f32 - scroll) * ROW_H;
-                    if let Some(sub) = settings::hit(&settings::ROWS[i], settings_ctl_right(g.content), row_y, x, y) {
-                        return Hit::Set(i, sub as u8);
-                    }
-                }
-            }
-        }
+        Tab::Settings => match settings::page_hit(page, g.content, scroll, x, y) {
+            Some(settings::PageHit::Cat(i)) => return Hit::Cat(i as u8),
+            Some(settings::PageHit::Row(i, sub)) => return Hit::Set(i, sub as u8),
+            None => {}
+        },
         Tab::Timer => {
             for (i, r) in g.t_presets.iter().enumerate() {
                 if r.contains(x, y) {
@@ -360,39 +362,39 @@ mod tests {
         let g = geo(Style::Notch);
         for i in 0..TAB_COUNT {
             let t = g.tabs[i];
-            assert_eq!(hit_test(&g, Tab::Media, t.cx(), t.cy(), 0.0, 0), Hit::Tab(i));
+            assert_eq!(hit_test(&g, Tab::Media, t.cx(), t.cy(), 0.0, 0, &home()), Hit::Tab(i));
         }
     }
 
     #[test]
     fn media_controls_hit() {
         let g = geo(Style::Island);
-        assert_eq!(hit_test(&g, Tab::Media, g.play.cx(), g.play.cy(), 0.0, 0), Hit::Play);
-        assert_eq!(hit_test(&g, Tab::Media, g.prev.cx(), g.prev.cy(), 0.0, 0), Hit::Prev);
-        assert_eq!(hit_test(&g, Tab::Media, g.next.cx(), g.next.cy(), 0.0, 0), Hit::Next);
-        match hit_test(&g, Tab::Media, g.bar.x + g.bar.w * 0.25, g.bar.cy(), 0.0, 0) {
+        assert_eq!(hit_test(&g, Tab::Media, g.play.cx(), g.play.cy(), 0.0, 0, &home()), Hit::Play);
+        assert_eq!(hit_test(&g, Tab::Media, g.prev.cx(), g.prev.cy(), 0.0, 0, &home()), Hit::Prev);
+        assert_eq!(hit_test(&g, Tab::Media, g.next.cx(), g.next.cy(), 0.0, 0, &home()), Hit::Next);
+        match hit_test(&g, Tab::Media, g.bar.x + g.bar.w * 0.25, g.bar.cy(), 0.0, 0, &home()) {
             Hit::Seek(f) => assert!((f - 0.25).abs() < 1e-3),
             other => panic!("{other:?}"),
         }
         // Controls are not active on other tabs.
-        assert_eq!(hit_test(&g, Tab::System, g.play.cx(), g.play.cy(), 0.0, 0), Hit::Body);
+        assert_eq!(hit_test(&g, Tab::System, g.play.cx(), g.play.cy(), 0.0, 0, &home()), Hit::Body);
     }
 
     #[test]
     fn clipboard_rows_follow_scroll() {
         let g = geo(Style::Notch);
         let y0 = g.content.y + CLIP_LIST_OFFSET + 3.0;
-        assert_eq!(hit_test(&g, Tab::Clipboard, g.content.cx(), y0, 0.0, 10), Hit::Row(0));
-        assert_eq!(hit_test(&g, Tab::Clipboard, g.content.cx(), y0 + ROW_H, 0.0, 10), Hit::Row(1));
-        assert_eq!(hit_test(&g, Tab::Clipboard, g.content.cx(), y0, 2.0, 10), Hit::Row(2));
+        assert_eq!(hit_test(&g, Tab::Clipboard, g.content.cx(), y0, 0.0, 10, &home()), Hit::Row(0));
+        assert_eq!(hit_test(&g, Tab::Clipboard, g.content.cx(), y0 + ROW_H, 0.0, 10, &home()), Hit::Row(1));
+        assert_eq!(hit_test(&g, Tab::Clipboard, g.content.cx(), y0, 2.0, 10, &home()), Hit::Row(2));
         // Past the last item.
-        assert_eq!(hit_test(&g, Tab::Clipboard, g.content.cx(), y0 + ROW_H * 3.0, 0.0, 2), Hit::Body);
+        assert_eq!(hit_test(&g, Tab::Clipboard, g.content.cx(), y0 + ROW_H * 3.0, 0.0, 2, &home()), Hit::Body);
         // The search box sits above the list.
-        assert_eq!(hit_test(&g, Tab::Clipboard, g.search.cx(), g.search.cy(), 0.0, 10), Hit::Search);
+        assert_eq!(hit_test(&g, Tab::Clipboard, g.search.cx(), g.search.cy(), 0.0, 10, &home()), Hit::Search);
         // Clear button doubles as the Timer mode toggle, but exists nowhere else.
-        assert_eq!(hit_test(&g, Tab::Clipboard, g.clear.cx(), g.clear.cy(), 0.0, 3), Hit::Clear);
-        assert_eq!(hit_test(&g, Tab::Timer, g.clear.cx(), g.clear.cy(), 0.0, 3), Hit::Clear);
-        assert_eq!(hit_test(&g, Tab::Media, g.clear.cx(), g.clear.cy(), 0.0, 3), Hit::Body);
+        assert_eq!(hit_test(&g, Tab::Clipboard, g.clear.cx(), g.clear.cy(), 0.0, 3, &home()), Hit::Clear);
+        assert_eq!(hit_test(&g, Tab::Timer, g.clear.cx(), g.clear.cy(), 0.0, 3, &home()), Hit::Clear);
+        assert_eq!(hit_test(&g, Tab::Media, g.clear.cx(), g.clear.cy(), 0.0, 3, &home()), Hit::Body);
     }
 
     #[test]
@@ -408,8 +410,8 @@ mod tests {
     #[test]
     fn outside_is_none() {
         let g = geo(Style::Notch);
-        assert_eq!(hit_test(&g, Tab::Media, 2.0, 2.0, 0.0, 0), Hit::None);
-        assert_eq!(hit_test(&g, Tab::Media, 240.0, 199.0, 0.0, 0), Hit::None);
+        assert_eq!(hit_test(&g, Tab::Media, 2.0, 2.0, 0.0, 0, &home()), Hit::None);
+        assert_eq!(hit_test(&g, Tab::Media, 240.0, 199.0, 0.0, 0, &home()), Hit::None);
     }
 
     #[test]
@@ -443,34 +445,48 @@ mod tests {
     fn timer_controls_hit_and_fit() {
         let g = geo(Style::Island);
         for (i, r) in g.t_presets.iter().enumerate() {
-            assert_eq!(hit_test(&g, Tab::Timer, r.cx(), r.cy(), 0.0, 0), Hit::Preset(i));
+            assert_eq!(hit_test(&g, Tab::Timer, r.cx(), r.cy(), 0.0, 0, &home()), Hit::Preset(i));
             assert!(r.right() <= g.content.right());
         }
-        assert_eq!(hit_test(&g, Tab::Timer, g.t_toggle.cx(), g.t_toggle.cy(), 0.0, 0), Hit::TimerToggle);
-        assert_eq!(hit_test(&g, Tab::Timer, g.t_ring.cx(), g.t_ring.cy(), 0.0, 0), Hit::TimerToggle);
-        assert_eq!(hit_test(&g, Tab::Timer, g.t_minus.cx(), g.t_minus.cy(), 0.0, 0), Hit::TimerMinus);
-        assert_eq!(hit_test(&g, Tab::Timer, g.t_plus.cx(), g.t_plus.cy(), 0.0, 0), Hit::TimerPlus);
-        assert_eq!(hit_test(&g, Tab::Timer, g.t_reset.cx(), g.t_reset.cy(), 0.0, 0), Hit::TimerReset);
+        assert_eq!(hit_test(&g, Tab::Timer, g.t_toggle.cx(), g.t_toggle.cy(), 0.0, 0, &home()), Hit::TimerToggle);
+        assert_eq!(hit_test(&g, Tab::Timer, g.t_ring.cx(), g.t_ring.cy(), 0.0, 0, &home()), Hit::TimerToggle);
+        assert_eq!(hit_test(&g, Tab::Timer, g.t_minus.cx(), g.t_minus.cy(), 0.0, 0, &home()), Hit::TimerMinus);
+        assert_eq!(hit_test(&g, Tab::Timer, g.t_plus.cx(), g.t_plus.cy(), 0.0, 0, &home()), Hit::TimerPlus);
+        assert_eq!(hit_test(&g, Tab::Timer, g.t_reset.cx(), g.t_reset.cy(), 0.0, 0, &home()), Hit::TimerReset);
         assert!(g.t_reset.right() <= g.content.right() && g.t_reset.bottom() <= g.content.bottom());
         // Timer controls do not exist on other tabs.
-        assert_eq!(hit_test(&g, Tab::Media, g.t_reset.cx(), g.t_reset.cy(), 0.0, 0), Hit::Body);
+        assert_eq!(hit_test(&g, Tab::Media, g.t_reset.cx(), g.t_reset.cy(), 0.0, 0, &home()), Hit::Body);
     }
 
     #[test]
-    fn settings_rows_hit_their_controls() {
+    fn settings_pages_hit_through_the_layout() {
+        use crate::config::Config;
+        use crate::settings::{Cat, Page};
         let g = geo(Style::Notch);
-        let n = settings::ROWS.len();
+        let c = Config::default();
+        // Home page: a card is a Cat hit, "Back" does not exist there.
+        let r = settings::card_rect(g.content, 3);
+        assert_eq!(hit_test(&g, Tab::Settings, r.cx(), r.cy(), 0.0, 0, &home()), Hit::Cat(3));
+        assert_eq!(hit_test(&g, Tab::Settings, g.clear.cx(), g.clear.cy(), 0.0, 0, &home()), Hit::Body);
+        // Category page: rows are Set hits, the header's left slot is Back.
+        let page = Page::new(Some(Cat::Look), &c);
         let right = settings_ctl_right(g.content);
-        for (i, row) in settings::ROWS.iter().enumerate().take(4) {
-            let y = g.content.y + i as f32 * ROW_H;
-            let (rects, count) = settings::sub_rects(row.ctl, right, y);
+        for (i, &id) in page.rows.as_slice().iter().enumerate() {
+            let (rects, count) = settings::sub_rects(settings::row(id).ctl, right, g.content.y + i as f32 * ROW_H);
             for k in 0..count {
-                let r = rects[k];
-                assert_eq!(hit_test(&g, Tab::Settings, r.cx(), r.cy(), 0.0, n), Hit::Set(i, k as u8), "row {i} sub {k}");
+                let rc = rects[k];
+                assert_eq!(hit_test(&g, Tab::Settings, rc.cx(), rc.cy(), 0.0, 0, &page), Hit::Set(i, k as u8), "row {i} sub {k}");
             }
         }
-        // Scrolled by two rows, the third visible row is row 5.
-        let (rects, _) = settings::sub_rects(settings::ROWS[5].ctl, right, g.content.y + 3.0 * ROW_H);
-        assert_eq!(hit_test(&g, Tab::Settings, rects[0].cx(), rects[0].cy(), 2.0, n), Hit::Set(5, 0));
+        assert_eq!(hit_test(&g, Tab::Settings, g.clear.cx(), g.clear.cy(), 0.0, 0, &page), Hit::Back);
+        // Back is a Settings-only button; tabs and the pin still win over the page.
+        assert_eq!(hit_test(&g, Tab::Clipboard, g.clear.cx(), g.clear.cy(), 0.0, 3, &page), Hit::Clear);
+        assert_eq!(hit_test(&g, Tab::Settings, g.tabs[0].cx(), g.tabs[0].cy(), 0.0, 0, &page), Hit::Tab(0));
+        // Home-page cards do not exist on other tabs.
+        assert_eq!(hit_test(&g, Tab::Media, r.cx(), r.cy(), 0.0, 0, &home()), Hit::Body);
+    }
+
+    fn home() -> settings::Page {
+        settings::Page::new(None, &crate::config::Config::default())
     }
 }
