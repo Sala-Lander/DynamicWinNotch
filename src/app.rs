@@ -968,6 +968,7 @@ impl App {
                 Ev::Mouse => {} // the cursor is re-read at the top of every update
                 Ev::Down(btn, x, y) => self.on_down(btn, x as f32 / scale, y as f32 / scale, now),
                 Ev::Wheel(d) => self.on_wheel(d),
+                Ev::HWheel(d) => self.on_hwheel(d),
                 Ev::MediaChanged => self.on_media(now),
                 Ev::ClipUpdate => {
                     let _ = self.clip_tx.send(ClipCmd::Read);
@@ -1298,6 +1299,20 @@ impl App {
             self.timer.adjust(notches.signum() as i32, self.clock_ms(now));
             self.last_timer_secs = u64::MAX;
         }
+        self.dirty = true;
+    }
+
+    /// Swipe / horizontal scroll: moves the shelf strip left or right (vertical wheel also works).
+    fn on_hwheel(&mut self, delta: i32) {
+        if !self.expanded || delta == 0 || self.tab != Tab::Shelf {
+            return;
+        }
+        let (x, y) = self.cursor;
+        if !self.geo.pill.contains(x, y) || y < self.geo.content.y {
+            return;
+        }
+        let notches = delta as f32 / 120.0;
+        self.shelf_target = (self.shelf_target + notches).clamp(0.0, shelf::max_scroll(self.shelf.len()));
         self.dirty = true;
     }
 

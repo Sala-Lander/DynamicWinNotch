@@ -38,6 +38,8 @@ pub enum Ev {
     Down(Btn, i32, i32),
     /// Wheel notches in 1/120 units, positive = away from the user.
     Wheel(i32),
+    /// Horizontal wheel / touchpad swipe, same units as `Wheel` (positive = right).
+    HWheel(i32),
     MediaChanged,
     /// The OS says the clipboard content changed.
     ClipUpdate,
@@ -385,6 +387,10 @@ unsafe extern "system" fn wndproc(hwnd: HANDLE, msg: u32, wp: usize, lp: isize) 
         }
         WM_MOUSEWHEEL => {
             push(Ev::Wheel(hiword(wp as isize)));
+            0
+        }
+        WM_MOUSEHWHEEL => {
+            push(Ev::HWheel(hiword(wp as isize)));
             0
         }
         WM_CLIPBOARDUPDATE => {
