@@ -13,9 +13,10 @@ use crate::layout::{
 };
 use crate::media::MediaView;
 use crate::settings::{self, Ctl};
+use crate::shelf::{self, Shelf};
 use crate::sys::Stats;
 use crate::timer::fmt_clock;
-use crate::util::{fmt_rate, fmt_time, lerp, marquee_offset, smoothstep};
+use crate::util::{fmt_bytes, fmt_rate, fmt_time, lerp, marquee_offset, smoothstep};
 use std::f32::consts::{FRAC_PI_2, TAU};
 use tiny_skia::{Color, Pixmap};
 
@@ -142,6 +143,12 @@ pub struct Scene<'a> {
     /// Privacy dots on the collapsed pill: an app uses the microphone / camera.
     pub mic_on: bool,
     pub cam_on: bool,
+    /// The Shelf tab: its items, strip scroll (in tiles), unix time (for the footer) and whether a
+    /// file is being dragged over the island right now.
+    pub shelf: &'a Shelf,
+    pub shelf_scroll: f32,
+    pub unix_now: u64,
+    pub drag_over: bool,
 }
 
 fn white(a: f32) -> Color {
@@ -244,6 +251,11 @@ fn draw_compact(cv: &mut Canvas, sc: &Scene, a: f32) {
                 cv.draw_image(img, Rect::new(p.x + 11.0, cy - 10.0, 20.0, 20.0), 6.0, ca);
             }
             draw_eq(cv, eq_right, cy, m.playing, sc.now, sc.accent, ca);
+        } else if !sc.shelf.is_empty() {
+            // Something waits on the shelf: a tiny tray and the item count on the left.
+            let (x, n) = (p.x + 12.0, sc.shelf.len().to_string());
+            draw_tray_icon(cv, x + 6.0, cy, 0.8, sc.accent, ca);
+            cv.text(&n, x + 17.0, cy + 4.0, 11.0, Weight::Semibold, WHITE, 0.8 * ca);
         }
     }
     if pa > 0.01 {
@@ -649,7 +661,7 @@ fn draw_expanded(cv: &mut Canvas, sc: &Scene, a: f32) -> bool {
         let act = 1.0 - (sc.tab_pos - i as f32).abs().min(1.0);
         let hov = if matches!(sc.hover, Hit::Tab(j) if j == i) { 1.0 } else { 0.0 };
         let alpha = (0.45 + 0.55 * act + 0.25 * hov * (1.0 - act)).min(1.0) * a;
-        cv.text_centered(tab.short(), r.cx(), r.y + 16.0, 11.5, Weight::Semibold, WHITE, alpha);
+        cv.text_centered(tab.short(), r.cx(), r.y + 16.0, 10.5, Weight::Semibold, WHITE, alpha);
     }
 
     draw_pin(cv, g.pin, sc.pinned, sc.hover == Hit::Pin, sc.accent, a);
@@ -671,9 +683,15 @@ fn draw_expanded(cv: &mut Canvas, sc: &Scene, a: f32) -> bool {
         let al = if sc.hover == Hit::Clear { 0.9 } else { 0.55 };
         cv.text(label, g.clear.x + 4.0, g.clear.y + 16.0, 11.5, Weight::Semibold, sc.accent, al * timer_vis * a);
     }
+    // Shelf: "Clear" empties the shelf.
+    let shelf_vis = 1.0 - (sc.tab_pos - 4.0).abs().min(1.0);
+    if shelf_vis > 0.01 && !sc.shelf.is_empty() {
+        let al = if sc.hover == Hit::Clear { 0.9 } else { 0.5 };
+        cv.text("Clear", g.clear.x + 4.0, g.clear.y + 16.0, 11.5, Weight::Semibold, WHITE, al * shelf_vis * a);
+    }
     // Settings: "Back" inside a category (it flashes in the accent colour after a change, which
     // replaces the old "Saved" note), the "Saved" note on the home page.
-    let set_vis = 1.0 - (sc.tab_pos - 4.0).abs().min(1.0);
+    let set_vis = 1.0 - (sc.tab_pos - 5.0).abs().min(1.0);
     if set_vis > 0.01 {
         if sc.scat.is_some() {
             let hov = sc.hover == Hit::Back;
@@ -701,6 +719,7 @@ fn draw_expanded(cv: &mut Canvas, sc: &Scene, a: f32) -> bool {
             1 => page_clip(cv, sc, ox, pa),
             2 => page_system(cv, sc, ox, pa),
             3 => page_timer(cv, sc, ox, pa),
+            4 => page_shelf(cv, sc, ox, pa),
             _ => page_settings(cv, sc, ox, pa),
         }
     }
@@ -1006,6 +1025,95 @@ fn battery_sub(st: &Stats) -> String {
         format!("{}h {:02}m left", s / 3600, (s % 3600) / 60)
     } else {
         "On battery".to_string()
+    }
+}
+
+// -------------------------------------------------------------------- shelf
+/// Dashed rounded outline (the strokes are tiny rounded bars along the four edges).
+fn dashed_frame(cv: &mut Canvas, r: Rect, color: (u8, u8, u8), alpha: f32) {
+    let (dash, gap, t) = (6.0f32, 5.0f32, 1.5f32);
+    let col = rgba(color, alpha);
+    let mut x = r.x + 10.0;
+    while x + dash <= r.right() - 10.0 {
+        cv.fill_rrect(Rect::new(x, r.y, dash, t), 0.7, col);
+        cv.fill_rrect(Rect::new(x, r.bottom() - t, dash, t), 0.7, col);
+        x += dash + gap;
+    }
+    let mut y = r.y + 10.0;
+    while y + dash <= r.bottom() - 10.0 {
+        cv.fill_rrect(Rect::new(r.x, y, t, dash), 0.7, col);
+        cv.fill_rrect(Rect::new(r.right() - t, y, t, dash), 0.7, col);
+        y += dash + gap;
+    }
+}
+
+/// A small open tray with a down arrow: "drop here".
+fn draw_tray_icon(cv: &mut Canvas, cx: f32, cy: f32, scale: f32, accent: (u8, u8, u8), a: f32) {
+    let k = scale;
+    cv.fill_rrect(Rect::new(cx - 7.0 * k, cy + 2.5 * k, 14.0 * k, 3.0 * k), 1.5 * k, white(0.9 * a));
+    cv.fill_rrect(Rect::new(cx - 0.9 * k, cy - 7.0 * k, 1.8 * k, 8.0 * k), 0.9 * k, rgba(accent, a));
+    if let Some(head) = gfx::poly(&[(cx - 4.5 * k, cy - 1.5 * k), (cx + 4.5 * k, cy - 1.5 * k), (cx, cy + 3.0 * k)]) {
+        cv.fill(&head, rgba(accent, a));
+    }
+}
+
+fn page_shelf(cv: &mut Canvas, sc: &Scene, ox: f32, a: f32) {
+    let c = sc.geo.content;
+    let area = Rect::new(c.x + ox, c.y, c.w, c.h - 6.0);
+    let over = sc.drag_over;
+
+    if sc.shelf.is_empty() {
+        let tint = if over { 0.14 } else { 0.0 };
+        if tint > 0.0 {
+            cv.fill_rrect(area, 16.0, rgba(sc.accent, tint * a));
+        }
+        dashed_frame(cv, area, if over { sc.accent } else { WHITE }, (if over { 1.0 } else { 0.26 }) * a);
+        let cx = area.cx();
+        draw_tray_icon(cv, cx, area.y + 32.0, 1.5, if over { WHITE } else { sc.accent }, (if over { 1.0 } else { 0.8 }) * a);
+        let title = if over { "Release to add" } else { "Drop files here" };
+        cv.text_centered(title, cx, area.y + 66.0, 14.0, Weight::Semibold, WHITE, 0.9 * a);
+        cv.text_centered("A temporary place \u{b7} drag them out again later", cx, area.y + 84.0, 11.0, Weight::Regular, WHITE, 0.45 * a);
+        return;
+    }
+
+    cv.clip_rect(Rect::new(c.x - 8.0 + ox, c.y, c.w + 16.0, c.h));
+    let first = sc.shelf_scroll.floor().max(0.0) as usize;
+    let last = (first + shelf::VISIBLE_TILES + 2).min(sc.shelf.len());
+    for i in first..last {
+        let it = &sc.shelf.items()[i];
+        let mut t = shelf::tile_rect(c, i, sc.shelf_scroll);
+        t.x += ox;
+        let hov = matches!(sc.hover, Hit::Tile(j) | Hit::TileX(j) if j == i);
+        cv.fill_rrect(t, 14.0, white((if hov { 0.14 } else { 0.07 }) * a));
+        let kind = it.kind();
+        let icon = Rect::new(t.cx() - 17.0, t.y + 9.0, 34.0, 34.0);
+        cv.fill_rrect(icon, 9.0, rgba(kind.color(), 0.95 * a));
+        cv.text_centered(kind.label(), icon.cx(), icon.y + 21.0, if kind.label().len() > 3 { 8.5 } else { 9.5 }, Weight::Semibold, (0, 0, 0), 0.8 * a);
+        let name = cv.fit(&it.name, 10.5, Weight::Regular, shelf::TILE_W - 8.0);
+        cv.text_centered(&name, t.cx(), t.y + 58.0, 10.5, Weight::Regular, WHITE, 0.92 * a);
+        let size = if it.dir { "Folder".to_string() } else { fmt_bytes(it.size as usize) };
+        cv.text_centered(&size, t.cx(), t.y + 72.0, 9.5, Weight::Regular, WHITE, 0.45 * a);
+        if hov {
+            let x = shelf::x_rect(t);
+            let hx = matches!(sc.hover, Hit::TileX(j) if j == i);
+            cv.fill_circle(x.cx(), x.cy(), 8.0, if hx { rgba((229, 72, 77), 0.95 * a) } else { rgba((0, 0, 0), 0.65 * a) });
+            cv.text_centered("\u{d7}", x.cx(), x.cy() + 4.0, 12.0, Weight::Semibold, WHITE, a);
+        }
+    }
+    cv.unclip_rect();
+
+    if over {
+        cv.fill_rrect(area, 16.0, rgba(sc.accent, 0.16 * a));
+        dashed_frame(cv, area, sc.accent, a);
+        cv.text_centered("Release to add", area.cx(), area.cy() + 4.0, 14.0, Weight::Semibold, WHITE, a);
+    } else {
+        let foot = sc.shelf.footer(sc.cfg.shelf_expire, sc.unix_now);
+        let hint = if sc.shelf.len() > shelf::VISIBLE_TILES { "scroll \u{b7} drag out to use" } else { "drag out to use" };
+        let hw = cv.text_width(hint, 10.0, Weight::Regular);
+        let avail = c.w - hw - 12.0;
+        let foot = cv.fit(&foot, 10.0, Weight::Regular, avail);
+        cv.text(&foot, c.x + ox + 2.0, c.y + 104.0, 10.0, Weight::Regular, WHITE, 0.45 * a);
+        cv.text(hint, c.right() + ox - 2.0 - hw, c.y + 104.0, 10.0, Weight::Regular, WHITE, 0.32 * a);
     }
 }
 

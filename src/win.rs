@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 pub const WM_APP_MEDIA: u32 = WM_APP + 1;
 pub const WM_APP_CLIP: u32 = WM_APP + 2;
@@ -68,6 +68,11 @@ pub enum Ev {
     Privacy,
     /// A Bluetooth device connected or disconnected (see `devices::spawn_bluetooth`).
     Bluetooth,
+    /// A file drag entered / left the island (see the OLE drop target below).
+    DragEnter,
+    DragLeave,
+    /// Files were dropped on the island; fetch them with `take_dropped()`.
+    Dropped,
 }
 
 thread_local! {
@@ -91,6 +96,228 @@ pub fn lock_edge(held: &mut u32, vk: u16, msg: u32) -> Option<u16> {
     } else {
         *held &= !bit;
         None
+    }
+}
+
+// ------------------------------------------------------------------ shelf: OLE drag and drop
+//
+// Dropping: the window is registered as an OLE drop target (hand-written COM object, no crate).
+// It accepts file drags (CF_HDROP) only, always as a *copy*, so the source never deletes anything.
+// While click-through the window is invisible to OLE, so `App` makes it hit-testable as soon as
+// the pointer is over the island with the button held (see `App::update`).
+//
+// Dragging out: a shell data object for the file (`SHCreateDataObject`) plus a tiny drop source
+// run inside `DoDragDrop`, which blocks until the user drops or cancels.
+thread_local! {
+    static DROPPED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+/// The drag now over the window carries files.
+static DRAG_OK: AtomicBool = AtomicBool::new(false);
+/// A drag *out of* the shelf is running: the shelf must not accept its own files back.
+static DRAGGING_OUT: AtomicBool = AtomicBool::new(false);
+
+/// Paths of the last drop (empties the list).
+pub fn take_dropped() -> Vec<String> {
+    DROPPED.with(|d| std::mem::take(&mut *d.borrow_mut()))
+}
+
+/// Is the left mouse button down right now (anywhere on screen)?
+pub fn lmb_down() -> bool {
+    unsafe { GetAsyncKeyState(VK_LBUTTON) < 0 }
+}
+
+#[repr(C)]
+struct DropTargetVtbl {
+    query_interface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+    drag_enter: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, POINTL, *mut u32) -> i32,
+    drag_over: unsafe extern "system" fn(*mut c_void, u32, POINTL, *mut u32) -> i32,
+    drag_leave: unsafe extern "system" fn(*mut c_void) -> i32,
+    drop: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, POINTL, *mut u32) -> i32,
+}
+
+#[repr(C)]
+struct DropSourceVtbl {
+    query_interface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+    query_continue_drag: unsafe extern "system" fn(*mut c_void, i32, u32) -> i32,
+    give_feedback: unsafe extern "system" fn(*mut c_void, u32) -> i32,
+}
+
+/// A COM object is just a pointer to its vtable; ours are immortal statics (no refcounting).
+#[repr(C)]
+struct ComObj<T>(*const T);
+unsafe impl<T> Sync for ComObj<T> {}
+
+unsafe extern "system" fn com_add_ref(_: *mut c_void) -> u32 {
+    1
+}
+unsafe extern "system" fn com_release(_: *mut c_void) -> u32 {
+    1
+}
+
+unsafe fn com_query(this: *mut c_void, riid: *const GUID, out: *mut *mut c_void, own: &GUID) -> i32 {
+    if !riid.is_null() && (*riid == IID_IUNKNOWN || *riid == *own) {
+        *out = this;
+        S_OK
+    } else {
+        *out = std::ptr::null_mut();
+        E_NOINTERFACE
+    }
+}
+
+unsafe extern "system" fn dt_query(this: *mut c_void, riid: *const GUID, out: *mut *mut c_void) -> i32 {
+    com_query(this, riid, out, &IID_IDROPTARGET)
+}
+
+/// Does the data object offer CF_HDROP (a list of files)?
+unsafe fn has_files(data: *mut c_void) -> bool {
+    if data.is_null() {
+        return false;
+    }
+    type QueryGetData = unsafe extern "system" fn(*mut c_void, *const FORMATETC) -> i32;
+    let vtbl = *(data as *const *const usize);
+    let query: QueryGetData = std::mem::transmute(*vtbl.add(5)); // IDataObject::QueryGetData
+    let fmt = FORMATETC { cfFormat: CF_HDROP as u16, ptd: null_mut(), dwAspect: DVASPECT_CONTENT, lindex: -1, tymed: TYMED_HGLOBAL };
+    query(data, &fmt) == S_OK
+}
+
+/// The file paths inside a CF_HDROP data object.
+unsafe fn read_files(data: *mut c_void) -> Vec<String> {
+    let mut out = Vec::new();
+    if data.is_null() {
+        return out;
+    }
+    type GetData = unsafe extern "system" fn(*mut c_void, *const FORMATETC, *mut STGMEDIUM) -> i32;
+    let vtbl = *(data as *const *const usize);
+    let get: GetData = std::mem::transmute(*vtbl.add(3)); // IDataObject::GetData
+    let fmt = FORMATETC { cfFormat: CF_HDROP as u16, ptd: null_mut(), dwAspect: DVASPECT_CONTENT, lindex: -1, tymed: TYMED_HGLOBAL };
+    let mut med = STGMEDIUM { tymed: 0, handle: null_mut(), pUnkForRelease: null_mut() };
+    if get(data, &fmt, &mut med) >= 0 {
+        let hdrop = med.handle as isize;
+        let n = DragQueryFileW(hdrop, u32::MAX, null_mut(), 0);
+        for i in 0..n {
+            let len = DragQueryFileW(hdrop, i, null_mut(), 0) as usize;
+            let mut buf = vec![0u16; len + 1];
+            let got = DragQueryFileW(hdrop, i, buf.as_mut_ptr(), buf.len() as u32) as usize;
+            if got > 0 {
+                out.push(String::from_utf16_lossy(&buf[..got.min(len)]));
+            }
+        }
+        ReleaseStgMedium(&mut med);
+    }
+    out
+}
+
+unsafe extern "system" fn dt_drag_enter(_: *mut c_void, data: *mut c_void, _key: u32, _pt: POINTL, effect: *mut u32) -> i32 {
+    let ok = !DRAGGING_OUT.load(Ordering::Relaxed) && has_files(data);
+    DRAG_OK.store(ok, Ordering::Relaxed);
+    if !effect.is_null() {
+        *effect = if ok { DROPEFFECT_COPY } else { DROPEFFECT_NONE };
+    }
+    if ok {
+        push(Ev::DragEnter);
+    }
+    S_OK
+}
+
+unsafe extern "system" fn dt_drag_over(_: *mut c_void, _key: u32, _pt: POINTL, effect: *mut u32) -> i32 {
+    if !effect.is_null() {
+        *effect = if DRAG_OK.load(Ordering::Relaxed) { DROPEFFECT_COPY } else { DROPEFFECT_NONE };
+    }
+    S_OK
+}
+
+unsafe extern "system" fn dt_drag_leave(_: *mut c_void) -> i32 {
+    if DRAG_OK.swap(false, Ordering::Relaxed) {
+        push(Ev::DragLeave);
+    }
+    S_OK
+}
+
+unsafe extern "system" fn dt_drop(_: *mut c_void, data: *mut c_void, _key: u32, _pt: POINTL, effect: *mut u32) -> i32 {
+    let ok = DRAG_OK.swap(false, Ordering::Relaxed);
+    if !effect.is_null() {
+        *effect = if ok { DROPEFFECT_COPY } else { DROPEFFECT_NONE };
+    }
+    if ok {
+        let files = read_files(data);
+        if !files.is_empty() {
+            DROPPED.with(|d| d.borrow_mut().extend(files));
+        }
+        push(Ev::Dropped);
+    }
+    S_OK
+}
+
+static DROP_TARGET_VTBL: DropTargetVtbl = DropTargetVtbl {
+    query_interface: dt_query,
+    add_ref: com_add_ref,
+    release: com_release,
+    drag_enter: dt_drag_enter,
+    drag_over: dt_drag_over,
+    drag_leave: dt_drag_leave,
+    drop: dt_drop,
+};
+static DROP_TARGET: ComObj<DropTargetVtbl> = ComObj(&DROP_TARGET_VTBL);
+
+unsafe extern "system" fn ds_query(this: *mut c_void, riid: *const GUID, out: *mut *mut c_void) -> i32 {
+    com_query(this, riid, out, &IID_IDROPSOURCE)
+}
+
+/// Esc cancels, releasing the left button drops, anything else keeps dragging.
+unsafe extern "system" fn ds_query_continue(_: *mut c_void, escape: i32, keys: u32) -> i32 {
+    if escape != 0 {
+        DRAGDROP_S_CANCEL
+    } else if keys & MK_LBUTTON == 0 {
+        DRAGDROP_S_DROP
+    } else {
+        S_OK
+    }
+}
+
+unsafe extern "system" fn ds_give_feedback(_: *mut c_void, _effect: u32) -> i32 {
+    DRAGDROP_S_USEDEFAULTCURSORS
+}
+
+static DROP_SOURCE_VTBL: DropSourceVtbl = DropSourceVtbl {
+    query_interface: ds_query,
+    add_ref: com_add_ref,
+    release: com_release,
+    query_continue_drag: ds_query_continue,
+    give_feedback: ds_give_feedback,
+};
+static DROP_SOURCE: ComObj<DropSourceVtbl> = ComObj(&DROP_SOURCE_VTBL);
+
+/// Drag `path` out of the island into whatever app is under the pointer. Blocks until the user
+/// drops or cancels (the left button must be down). Returns false if the drag could not start.
+pub fn drag_out(path: &str) -> bool {
+    unsafe {
+        let name = wide(path);
+        let mut pidl: *mut c_void = null_mut();
+        if SHParseDisplayName(name.as_ptr(), null_mut(), &mut pidl, 0, null_mut()) < 0 || pidl.is_null() {
+            return false;
+        }
+        let list = [pidl as *const c_void];
+        let mut data: *mut c_void = null_mut();
+        let hr = SHCreateDataObject(null(), 1, list.as_ptr(), null_mut(), &IID_IDATAOBJECT, &mut data);
+        ILFree(pidl);
+        if hr < 0 || data.is_null() {
+            return false;
+        }
+        DRAGGING_OUT.store(true, Ordering::Relaxed);
+        let mut effect = 0u32;
+        // Copy only: dragging out of the shelf never moves or deletes the original.
+        DoDragDrop(data, &DROP_SOURCE as *const _ as *mut c_void, DROPEFFECT_COPY, &mut effect);
+        DRAGGING_OUT.store(false, Ordering::Relaxed);
+        // IUnknown::Release (vtable slot 2) on the data object we created.
+        type Release = unsafe extern "system" fn(*mut c_void) -> u32;
+        let vtbl = *(data as *const *const usize);
+        let release: Release = std::mem::transmute(*vtbl.add(2));
+        release(data);
+        true
     }
 }
 
@@ -601,8 +828,19 @@ impl Win {
         }
     }
 
+    /// Make the window a target for file drops (OLE). Must run on the thread that owns the window.
+    pub fn register_drop_target(&self) {
+        unsafe {
+            if OleInitialize(null_mut()) >= 0 {
+                RegisterDragDrop(self.hwnd, &DROP_TARGET as *const _ as *mut c_void);
+            }
+        }
+    }
+
     pub fn destroy(&mut self) {
         unsafe {
+            RevokeDragDrop(self.hwnd);
+            OleUninitialize();
             UnregisterHotKey(self.hwnd, HOTKEY_ID);
             RemoveClipboardFormatListener(self.hwnd);
             DestroyWindow(self.hwnd);

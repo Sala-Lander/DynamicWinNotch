@@ -9,7 +9,7 @@
 //! 4-second housekeeping tick.
 
 use crate::clip::{self, ClipCmd, ClipFlags, ClipItem};
-use crate::config::{self, gb, sev, Config, Dnd, ExpandOn, FullscreenMode};
+use crate::config::{self, gb, sev, Config, Dnd, ExpandOn, FullscreenMode, ShelfExpire, ShelfMode};
 use crate::ffi::{PostQuitMessage, VK_BACK, VK_CAPITAL, VK_ESCAPE, VK_RETURN, WM_LBUTTONUP, WM_RBUTTONUP};
 use crate::gfx::{pixmap_from_rgba, Canvas};
 use crate::history::{Entry, History, Kind};
@@ -21,6 +21,7 @@ use crate::media::{self, Cmd, MediaView, Msg, Shared};
 use crate::notify;
 use crate::power::{PowerEvent, Watcher};
 use crate::settings::{self, Action};
+use crate::shelf::{self, Added, Item, Shelf};
 use crate::sound::{self, Sound, Sounds};
 use crate::spring::Spring;
 use crate::sys::{self, Sampler};
@@ -29,9 +30,10 @@ use crate::ui::{self, PeekInfo, PeekKind, PowerIcon, Scene, TimerMode, TimerView
 use crate::util::{clamp01, fmt_bytes, single_line};
 use crate::win::{self, Btn, Ev, Tray, Win};
 use crate::{fps, ping};
+use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub enum Next {
     Frame,
@@ -54,6 +56,8 @@ const SAVED_FADE: f32 = 0.6;
 const FLASH_SECS: f32 = 0.8;
 const SAMPLE_EVERY: Duration = Duration::from_secs(1);
 const HOUSEKEEPING_EVERY: Duration = Duration::from_secs(4);
+/// Bigger files are only linked on the shelf, even in "copies" mode (copying would stall the island).
+const SHELF_COPY_MAX: u64 = 512 * 1024 * 1024;
 
 pub struct App {
     cfg: Config,
@@ -70,6 +74,7 @@ pub struct App {
     tab_s: Spring,
     scroll_s: Spring,
     sscroll_s: Spring,
+    shelf_s: Spring,
     press_s: Spring,
     gauge: [Spring; 3],
 
@@ -85,11 +90,19 @@ pub struct App {
     cursor: (f32, f32),
     scroll_target: f32,
     sscroll_target: f32,
+    shelf_target: f32,
     /// Settings tab: the open category (`None` = the home page with the category cards).
     settings_cat: Option<settings::Cat>,
     flash: Option<(usize, Instant)>,
     /// Built-in and user sounds (`sound.rs`).
     sounds: Sounds,
+
+    /// The Shelf tab (`shelf.rs`): files waiting to be dragged out again.
+    shelf: Shelf,
+    /// A file drag is over the island right now.
+    drag_over: bool,
+    /// Shelf tile that was pressed and not yet released / dragged: (index, pointer at press).
+    tile_press: Option<(usize, (f32, f32))>,
 
     media: MediaView,
     media_tx: Sender<Msg>,
@@ -166,6 +179,7 @@ impl App {
         let cv = Canvas::new(win.size_px.0 as u32, win.size_px.1 as u32, win.scale);
         let tray = Tray::add(win.hwnd);
         win.listen_clipboard();
+        win.register_drop_target();
         win.register_hotkey(cfg.hotkey);
         win.watch_lock_keys(cfg.lock_peek);
         devices::spawn_volume(win.hwnd);
@@ -184,6 +198,7 @@ impl App {
         let mut clip = History::new(cfg.history_size);
         clip.set_budget(cfg.image_budget_mb as usize * 1024 * 1024);
         let sounds = Sounds::new(&cfg);
+        let shelf = load_shelf(&cfg);
         let app = App {
             geo: layout::geo(cfg.style),
             clip,
@@ -197,6 +212,7 @@ impl App {
             tab_s: Spring::new(tab.index() as f32, 320.0, 0.85),
             scroll_s: Spring::new(0.0, 260.0, 1.0),
             sscroll_s: Spring::new(0.0, 260.0, 1.0),
+            shelf_s: Spring::new(0.0, 260.0, 1.0),
             press_s: Spring::new(0.0, 520.0, 0.55),
             gauge: [Spring::new(0.0, 110.0, 1.0); 3],
             expanded: false,
@@ -210,9 +226,13 @@ impl App {
             cursor: (-1000.0, -1000.0),
             scroll_target: 0.0,
             sscroll_target: 0.0,
+            shelf_target: 0.0,
             settings_cat: None,
             flash: None,
             sounds,
+            shelf,
+            drag_over: false,
+            tile_press: None,
             media: MediaView::new(),
             media_tx,
             media_shared,
@@ -260,6 +280,10 @@ impl App {
     }
 
     pub fn shutdown(&mut self) {
+        if self.cfg.shelf_expire == ShelfExpire::OnQuit {
+            purge(self.shelf.clear());
+        }
+        save_shelf(&self.shelf);
         self.tray.remove();
         let _ = self.media_tx.send(Msg::Quit);
         let _ = self.notify_tx.send(notify::Msg::Quit);
@@ -279,6 +303,7 @@ impl App {
         let now = Instant::now();
         self.cursor = self.win.cursor_logical();
         self.process_events(now);
+        self.update_tile_press(now);
         self.update_timers(now);
         self.update_hover(now);
         self.apply_targets();
@@ -288,7 +313,10 @@ impl App {
         }
         self.update_periodic(now);
         let hover_mode = !self.expanded && self.cfg.expand_on == ExpandOn::Hover;
-        self.win.set_click_through(self.game_bar || (hover_mode && self.peek_link().is_none()));
+        // A file drag can only reach the island if the window is hit-testable: while the button
+        // is held with the pointer on the collapsed island, stop being click-through.
+        let drag_armed = self.cfg.shelf_peek && !self.game_bar && win::lmb_down() && self.hot_rect().contains(self.cursor.0, self.cursor.1);
+        self.win.set_click_through(self.game_bar || (hover_mode && self.peek_link().is_none() && !drag_armed));
 
         // Render at most `fps_cap` times per second.
         let min_iv = Duration::from_secs_f32(1.0 / self.cfg.fps_cap.max(1) as f32);
@@ -331,6 +359,7 @@ impl App {
             && self.tab_s.at_rest()
             && self.scroll_s.at_rest()
             && self.sscroll_s.at_rest()
+            && self.shelf_s.at_rest()
             && self.press_s.at_rest()
             && self.gauge.iter().all(|g| g.at_rest()))
     }
@@ -349,6 +378,7 @@ impl App {
             &mut self.tab_s,
             &mut self.scroll_s,
             &mut self.sscroll_s,
+            &mut self.shelf_s,
             &mut self.press_s,
         ] {
             if !s.at_rest() {
@@ -384,6 +414,8 @@ impl App {
         let max_s = settings::Page::new(self.settings_cat, &self.cfg).max_scroll();
         self.sscroll_target = self.sscroll_target.clamp(0.0, max_s);
         self.sscroll_s.set_target(self.sscroll_target);
+        self.shelf_target = self.shelf_target.clamp(0.0, shelf::max_scroll(self.shelf.len()));
+        self.shelf_s.set_target(self.shelf_target);
     }
 
     // ------------------------------------------------------- hover / modes
@@ -447,6 +479,7 @@ impl App {
         let (scroll, rows) = match self.tab {
             Tab::Settings => (self.sscroll_s.pos, 0),
             Tab::Clipboard => (self.scroll_s.pos, self.filtered_clip().len()),
+            Tab::Shelf => (self.shelf_s.pos, self.shelf.len()),
             _ => (self.scroll_s.pos, self.clip.len()),
         };
         let page = settings::Page::new(self.settings_cat, &self.cfg);
@@ -467,6 +500,9 @@ impl App {
         self.dirty = true;
         if self.tab == Tab::System {
             self.sample_now();
+        }
+        if self.tab == Tab::Shelf {
+            self.shelf_prune();
         }
     }
 
@@ -499,6 +535,9 @@ impl App {
         self.tab = t;
         if t == Tab::System {
             self.sample_now();
+        }
+        if t == Tab::Shelf {
+            self.shelf_prune();
         }
         if t == Tab::Settings {
             self.autostart = win::autostart_enabled(); // may have been changed from the tray menu
@@ -799,6 +838,9 @@ impl App {
     /// Hide for full-screen apps, or show a tiny click-through game bar instead - keep the
     /// window above other topmost windows either way.
     fn housekeeping(&mut self) {
+        if !self.shelf.is_empty() && shelf::expiry_secs(self.cfg.shelf_expire).is_some() {
+            self.shelf_prune();
+        }
         let fullscreen = self.cfg.hide_fullscreen && win::fullscreen_app_active();
         match self.cfg.fullscreen_mode {
             FullscreenMode::GameBar => {
@@ -956,7 +998,111 @@ impl App {
                 Ev::Lock(vk) => self.lock_check = Some((vk, now + LOCK_SETTLE)),
                 Ev::Privacy => self.on_privacy(now),
                 Ev::Bluetooth => self.on_bluetooth(now),
+                Ev::DragEnter => self.on_drag_enter(),
+                Ev::DragLeave => {
+                    self.drag_over = false;
+                    self.dirty = true;
+                }
+                Ev::Dropped => {
+                    self.drag_over = false;
+                    let files = win::take_dropped();
+                    self.shelf_add(files, now);
+                }
             }
+        }
+    }
+
+    // ---------------------------------------------------------------- shelf
+    /// A file drag reached the island: show the shelf (if "Open shelf on file drag" is on).
+    fn on_drag_enter(&mut self) {
+        self.drag_over = true;
+        if self.cfg.shelf_peek {
+            self.set_tab(Tab::Shelf);
+            self.expand();
+        }
+        self.dirty = true;
+    }
+
+    /// Put dropped files on the shelf (links, or private copies in "copies" mode).
+    fn shelf_add(&mut self, paths: Vec<String>, now: Instant) {
+        let t = unix_now();
+        let dir = config::shelf_dir();
+        let mut added = 0;
+        for p in paths {
+            let Some(mut item) = shelf::scan(Path::new(&p), t) else { continue };
+            if self.cfg.shelf_mode == ShelfMode::Copies && !item.dir && item.size <= SHELF_COPY_MAX {
+                if let Some(copy) = dir.as_deref().and_then(|d| shelf::copy_into(d, Path::new(&p)).ok()) {
+                    if let Some(c) = copy.to_str() {
+                        item = Item::new(c, item.size, false, t, true);
+                    }
+                }
+                // A failed copy simply stays a link.
+            }
+            match self.shelf.add(item.clone()) {
+                Added::New(old) => {
+                    added += 1;
+                    purge(old.into_iter().collect());
+                }
+                Added::Duplicate => purge(vec![item]), // a fresh copy of something already there
+            }
+        }
+        if added > 0 {
+            self.sounds.ui(Sound::Shelf, now);
+            self.shelf_target = shelf::max_scroll(self.shelf.len()); // show the newest
+            save_shelf(&self.shelf);
+            if self.expanded {
+                self.set_tab(Tab::Shelf);
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn shelf_remove(&mut self, i: usize) {
+        if let Some(it) = self.shelf.remove(i) {
+            purge(vec![it]);
+            save_shelf(&self.shelf);
+        }
+        self.dirty = true;
+    }
+
+    fn shelf_clear(&mut self) {
+        purge(self.shelf.clear());
+        save_shelf(&self.shelf);
+        self.shelf_target = 0.0;
+        self.dirty = true;
+    }
+
+    /// Forget items whose file has disappeared, and items past their expiry.
+    fn shelf_prune(&mut self) {
+        let mut gone = self.shelf.take_expired(unix_now(), self.cfg.shelf_expire);
+        gone.extend(self.shelf.take_missing(|i| Path::new(&i.path).exists()));
+        if !gone.is_empty() {
+            purge(gone);
+            save_shelf(&self.shelf);
+            self.dirty = true;
+        }
+    }
+
+    /// A pressed shelf tile becomes a click (release in place: open the file) or a drag-out
+    /// (the pointer moved with the button held: hand the file to whatever app is under it).
+    fn update_tile_press(&mut self, now: Instant) {
+        let Some((i, down)) = self.tile_press else { return };
+        let released = !win::lmb_down();
+        if !released && !shelf::drag_started(down, self.cursor) {
+            return;
+        }
+        self.tile_press = None;
+        let Some(it) = self.shelf.get(i).cloned() else { return };
+        if !Path::new(&it.path).exists() {
+            self.shelf_remove(i);
+            return;
+        }
+        if released {
+            self.sounds.ui(Sound::Tick, now);
+            win::open_in_editor(Path::new(&it.path));
+        } else {
+            win::drag_out(&it.path);
+            self.dirty = true;
         }
     }
 
@@ -1022,16 +1168,20 @@ impl App {
         self.press_s.set_target(1.0);
         self.press_until = Some(now + Duration::from_millis(110));
         // Click sound. Settings controls and the search box make their own (or no) sound.
-        if btn == Btn::Left && !matches!(hit, Hit::Set(..) | Hit::Seek(_) | Hit::Search) {
+        if btn == Btn::Left && !matches!(hit, Hit::Set(..) | Hit::Seek(_) | Hit::Search | Hit::Tile(_)) {
             self.sounds.ui(Sound::Tick, now);
         }
 
         match (btn, hit) {
             (Btn::Left, Hit::Tab(i)) => self.set_tab(Tab::from_index(i)),
             (Btn::Left, Hit::Pin) => self.toggle_pin(),
+            (Btn::Left, Hit::Tile(i)) => self.tile_press = Some((i, (x, y))),
+            (Btn::Left, Hit::TileX(i)) | (Btn::Middle, Hit::Tile(i)) => self.shelf_remove(i),
             (Btn::Left, Hit::Clear) => {
                 if self.tab == Tab::Timer {
                     self.cycle_timer_mode();
+                } else if self.tab == Tab::Shelf {
+                    self.shelf_clear();
                 } else {
                     self.clip.clear_unpinned();
                     self.scroll_target = 0.0;
@@ -1138,6 +1288,8 @@ impl App {
         } else if self.tab == Tab::Clipboard {
             let max = self.filtered_clip().len().saturating_sub(CLIP_VISIBLE_ROWS) as f32;
             self.scroll_target = (self.scroll_target - notches).clamp(0.0, max);
+        } else if self.tab == Tab::Shelf {
+            self.shelf_target = (self.shelf_target - notches).clamp(0.0, shelf::max_scroll(self.shelf.len()));
         } else if self.tab == Tab::Settings {
             let max = settings::Page::new(self.settings_cat, &self.cfg).max_scroll();
             self.sscroll_target = (self.sscroll_target - notches).clamp(0.0, max);
@@ -1435,11 +1587,59 @@ impl App {
             ping_ms: self.pinger.ms(),
             mic_on: self.cfg.privacy_dot && self.in_use.mic.is_some(),
             cam_on: self.cfg.privacy_dot && self.in_use.cam.is_some(),
+            shelf: &self.shelf,
+            shelf_scroll: self.shelf_s.pos,
+            unix_now: unix_now(),
+            drag_over: self.drag_over,
         };
         self.marquee = ui::draw(&mut self.cv, &scene);
         self.win.present(self.cv.pm.data());
         self.last_render = now;
         self.dirty = false;
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Delete the private copies behind removed shelf items (links are never touched).
+fn purge(items: Vec<Item>) {
+    if let Some(dir) = config::shelf_dir() {
+        for it in &items {
+            shelf::remove_owned(it, &dir);
+        }
+    }
+}
+
+/// The shelf as it was left, minus what expired or vanished meanwhile.
+fn load_shelf(cfg: &Config) -> Shelf {
+    let mut s = config::shelf_list()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| shelf::from_text(&t))
+        .unwrap_or_default();
+    if cfg.shelf_expire == ShelfExpire::OnQuit {
+        purge(s.clear()); // a crash skipped the clean-up at quit
+    } else {
+        purge(s.take_expired(unix_now(), cfg.shelf_expire));
+        purge(s.take_missing(|i| Path::new(&i.path).exists()));
+    }
+    save_shelf(&s);
+    s
+}
+
+fn save_shelf(s: &Shelf) {
+    let Some(p) = config::shelf_list() else { return };
+    if s.is_empty() {
+        let _ = std::fs::remove_file(&p);
+        return;
+    }
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = p.with_extension("txt.tmp");
+    if std::fs::write(&tmp, shelf::to_text(s)).is_ok() {
+        let _ = std::fs::rename(&tmp, &p);
     }
 }
 

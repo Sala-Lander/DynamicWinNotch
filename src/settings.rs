@@ -7,7 +7,7 @@
 //! shows that category's rows (a list, or for Peeks a grid of switches).
 
 use crate::config::{
-    gb, sev, AlarmRepeat, AlarmTone, Config, Dnd, ExpandOn, FullscreenMode, SoundPack,
+    gb, sev, AlarmRepeat, AlarmTone, Config, Dnd, ExpandOn, FullscreenMode, ShelfExpire, ShelfMode, SoundPack,
 };
 use crate::layout::{settings_ctl_right, Rect, Style, ROW_H, VISIBLE_ROWS};
 
@@ -60,6 +60,9 @@ pub enum Id {
     AlarmTone,
     AlarmRepeat,
     SoundFiles,
+    ShelfPeek,
+    ShelfMode,
+    ShelfExpire,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,7 +87,7 @@ pub struct Row {
     pub ctl: Ctl,
 }
 
-pub const ROWS: [Row; 34] = [
+pub const ROWS: [Row; 37] = [
     Row { id: Id::ExpandOn, label: "Expand on", ctl: Ctl::Seg(&["Hover", "Click"]) },
     Row { id: Id::Style, label: "Style", ctl: Ctl::Seg(&["Notch", "Island"]) },
     Row { id: Id::Accent, label: "Accent colour", ctl: Ctl::Swatch },
@@ -119,6 +122,9 @@ pub const ROWS: [Row; 34] = [
     Row { id: Id::AlarmTone, label: "Timer alarm", ctl: Ctl::Seg(&["Off", "Chime", "Beep", "Bell"]) },
     Row { id: Id::AlarmRepeat, label: "Alarm repeat", ctl: Ctl::Seg(&["Once", "3\u{d7}", "Loop"]) },
     Row { id: Id::SoundFiles, label: "Own sounds (.wav)", ctl: Ctl::Buttons(&["Folder", "Reload"]) },
+    Row { id: Id::ShelfPeek, label: "Open shelf on file drag", ctl: Ctl::Toggle },
+    Row { id: Id::ShelfMode, label: "Shelf keeps", ctl: Ctl::Seg(&["Links", "Copies"]) },
+    Row { id: Id::ShelfExpire, label: "Shelf clears", ctl: Ctl::Seg(&["Never", "1 h", "1 d", "Quit"]) },
 ];
 
 /// The row definition for an id.
@@ -174,11 +180,12 @@ pub fn grid_label(id: Id) -> &'static str {
         Id::LockPeek => "Caps / Num Lock",
         Id::BtPeek => "Bluetooth",
         Id::PrivacyDot => "Mic & camera",
+        Id::ShelfPeek => "Drag to shelf",
         _ => row(id).label,
     }
 }
 
-pub const MAX_PAGE_ROWS: usize = 8;
+pub const MAX_PAGE_ROWS: usize = 9;
 
 /// The rows currently shown on a category page (some depend on other settings).
 #[derive(Clone, Copy, Debug)]
@@ -217,6 +224,7 @@ pub fn rows_of(cat: Cat, c: &Config) -> RowList {
             Id::LockPeek,
             Id::BtPeek,
             Id::PrivacyDot,
+            Id::ShelfPeek,
         ]),
         Cat::Sounds => {
             if c.sounds {
@@ -241,7 +249,14 @@ pub fn rows_of(cat: Cat, c: &Config) -> RowList {
                 RowList::from(&[Id::Dnd, Id::HideFullscreen, Id::FullscreenMode])
             }
         }
-        Cat::Data => RowList::from(&[Id::ClipImages, Id::Privacy, Id::HistorySize, Id::NetSpeed]),
+        Cat::Data => RowList::from(&[
+            Id::ClipImages,
+            Id::Privacy,
+            Id::HistorySize,
+            Id::NetSpeed,
+            Id::ShelfMode,
+            Id::ShelfExpire,
+        ]),
     }
 }
 
@@ -474,6 +489,7 @@ fn toggle_cfg(id: Id, c: &Config) -> bool {
         Id::LockPeek => c.lock_peek,
         Id::BtPeek => c.bt_peek,
         Id::PrivacyDot => c.privacy_dot,
+        Id::ShelfPeek => c.shelf_peek,
         Id::SoundsOn => c.sounds,
         Id::UiSounds => c.ui_sounds,
         _ => false,
@@ -510,6 +526,13 @@ pub fn seg_selected(id: Id, c: &Config) -> Option<usize> {
             AlarmTone::Chime => 1,
             AlarmTone::Beep => 2,
             AlarmTone::Bell => 3,
+        }),
+        Id::ShelfMode => Some((c.shelf_mode == ShelfMode::Copies) as usize),
+        Id::ShelfExpire => Some(match c.shelf_expire {
+            ShelfExpire::Never => 0,
+            ShelfExpire::Hour => 1,
+            ShelfExpire::Day => 2,
+            ShelfExpire::OnQuit => 3,
         }),
         Id::AlarmRepeat => Some(match c.alarm_repeat {
             AlarmRepeat::Once => 0,
@@ -591,6 +614,16 @@ pub fn apply(c: &mut Config, autostart: bool, id: Id, sub: usize) -> Action {
         Id::LockPeek => c.lock_peek = !c.lock_peek,
         Id::BtPeek => c.bt_peek = !c.bt_peek,
         Id::PrivacyDot => c.privacy_dot = !c.privacy_dot,
+        Id::ShelfPeek => c.shelf_peek = !c.shelf_peek,
+        Id::ShelfMode => c.shelf_mode = if sub == 1 { ShelfMode::Copies } else { ShelfMode::Links },
+        Id::ShelfExpire => {
+            c.shelf_expire = match sub {
+                0 => ShelfExpire::Never,
+                1 => ShelfExpire::Hour,
+                3 => ShelfExpire::OnQuit,
+                _ => ShelfExpire::Day,
+            }
+        }
         Id::Dnd => {
             c.dnd = match sub {
                 1 => Dnd::On,
@@ -736,9 +769,9 @@ mod tests {
         assert_eq!(rows_of(Cat::Sounds, &c).len(), 8);
         c.sounds = false;
         assert_eq!(rows_of(Cat::Sounds, &c).as_slice(), &[Id::SoundsOn]);
-        // Only Focus (game bar on), General and Sounds scroll; Look and Data fit exactly.
+        // Focus (game bar on), General, Sounds and Data scroll; Look and the Peeks grid fit exactly.
         assert_eq!(Page::new(Some(Cat::Look), &c).max_scroll(), 0.0);
-        assert_eq!(Page::new(Some(Cat::Data), &c).max_scroll(), 0.0);
+        assert_eq!(Page::new(Some(Cat::Data), &c).max_scroll(), 2.0);
         assert_eq!(Page::new(Some(Cat::General), &c).max_scroll(), 1.0);
         assert_eq!(Page::new(Some(Cat::Peeks), &c).max_scroll(), 0.0);
         assert_eq!(Page::new(None, &c).max_scroll(), 0.0);
@@ -796,9 +829,9 @@ mod tests {
             let r = grid_rect(g.content, i);
             assert_eq!(page_hit(&page, g.content, 0.0, r.cx(), r.cy()), Some(PageHit::Row(i, 0)));
         }
-        // the 9th cell is empty
-        let r = grid_rect(g.content, 8);
-        assert_eq!(page_hit(&page, g.content, 0.0, r.cx(), r.cy()), None);
+        // the gap between two chips is nothing
+        let a = grid_rect(g.content, 0);
+        assert_eq!(page_hit(&page, g.content, 0.0, a.right() + 3.0, a.cy()), None);
     }
 
     #[test]
@@ -834,7 +867,7 @@ mod tests {
             assert!(!s.is_empty() && s.chars().count() <= 20, "{cat:?}: {s}");
         }
         assert_eq!(summary(Cat::Sounds, &Config { sounds: false, ..c.clone() }), "Off");
-        assert_eq!(summary(Cat::Peeks, &Config::default()), format!("{} of 8 on", 7));
+        assert_eq!(summary(Cat::Peeks, &Config::default()), "8 of 9 on".to_string());
     }
 
     #[test]
@@ -846,6 +879,28 @@ mod tests {
         assert_eq!(c.dnd, Dnd::Games);
         assert_eq!(seg_selected(Id::Dnd, &c), Some(2));
         assert_eq!(apply(&mut c, false, Id::Dnd, 2), Action::Nothing);
+    }
+
+    #[test]
+    fn shelf_rows_edit_the_shelf_config() {
+        let mut c = Config::default();
+        assert!(c.shelf_peek);
+        assert_eq!(apply(&mut c, false, Id::ShelfPeek, 0), Action::Changed);
+        assert!(!c.shelf_peek);
+        assert!(rows_of(Cat::Peeks, &c).as_slice().contains(&Id::ShelfPeek));
+        assert_eq!(rows_of(Cat::Peeks, &c).len(), 9);
+        assert_eq!(grid_label(Id::ShelfPeek), "Drag to shelf");
+        assert_eq!(apply(&mut c, false, Id::ShelfMode, 1), Action::Changed);
+        assert_eq!(c.shelf_mode, ShelfMode::Copies);
+        assert_eq!(seg_selected(Id::ShelfMode, &c), Some(1));
+        assert_eq!(apply(&mut c, false, Id::ShelfMode, 1), Action::Nothing);
+        for (sub, e) in [(0, ShelfExpire::Never), (1, ShelfExpire::Hour), (2, ShelfExpire::Day), (3, ShelfExpire::OnQuit)] {
+            apply(&mut c, false, Id::ShelfExpire, sub);
+            assert_eq!(c.shelf_expire, e);
+            assert_eq!(seg_selected(Id::ShelfExpire, &c), Some(sub));
+        }
+        let data = rows_of(Cat::Data, &c);
+        assert!(data.as_slice().contains(&Id::ShelfMode) && data.as_slice().contains(&Id::ShelfExpire));
     }
 
     #[test]

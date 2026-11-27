@@ -20,6 +20,7 @@ mod notify;
 mod ping;
 mod power;
 mod settings;
+mod shelf;
 mod sound;
 mod spring;
 mod sys;

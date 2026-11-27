@@ -2,6 +2,7 @@
 //! the renderer multiplies by the DPI scale. No OS calls, so it is unit-tested.
 
 use crate::settings;
+use crate::shelf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct Rect {
@@ -44,13 +45,14 @@ pub enum Tab {
     Clipboard,
     System,
     Timer,
+    Shelf,
     Settings,
 }
 
-pub const TAB_COUNT: usize = 5;
+pub const TAB_COUNT: usize = 6;
 
 impl Tab {
-    pub const ALL: [Tab; TAB_COUNT] = [Tab::Media, Tab::Clipboard, Tab::System, Tab::Timer, Tab::Settings];
+    pub const ALL: [Tab; TAB_COUNT] = [Tab::Media, Tab::Clipboard, Tab::System, Tab::Timer, Tab::Shelf, Tab::Settings];
 
     pub fn index(self) -> usize {
         self as usize
@@ -64,6 +66,7 @@ impl Tab {
             Tab::Clipboard => "Clipboard",
             Tab::System => "System",
             Tab::Timer => "Timer",
+            Tab::Shelf => "Shelf",
             Tab::Settings => "Settings",
         }
     }
@@ -80,6 +83,7 @@ impl Tab {
             "clipboard" | "clip" => Some(Tab::Clipboard),
             "system" | "sys" => Some(Tab::System),
             "timer" => Some(Tab::Timer),
+            "shelf" => Some(Tab::Shelf),
             "settings" | "prefs" => Some(Tab::Settings),
             _ => None,
         }
@@ -182,7 +186,7 @@ pub fn settings_ctl_right(content: Rect) -> f32 {
 
 pub fn geo(style: Style) -> Geo {
     let p = pill_rect(style, EXPANDED.0, EXPANDED.1);
-    let (tab_w, gap) = (62.0, 3.0);
+    let (tab_w, gap) = (50.0, 2.0);
     let x0 = p.x + 80.0;
     let ty = p.y + 10.0;
     let mut tabs = [Rect::default(); TAB_COUNT];
@@ -257,6 +261,10 @@ pub enum Hit {
     Cat(u8),
     /// "Back" to the Settings home page (sits in the header's left slot).
     Back,
+    /// Shelf tile `i` (click opens it, press-and-move drags it out).
+    Tile(usize),
+    /// The remove button of shelf tile `i`.
+    TileX(usize),
     Preset(usize),
     TimerMinus,
     TimerToggle,
@@ -268,6 +276,7 @@ pub enum Hit {
 
 /// `scroll` is the clipboard / settings-list scroll position in rows (fractional while
 /// animating); `page` says what the Settings tab currently shows.
+/// For the Shelf tab `scroll` is the strip position in tiles and `rows` the item count.
 pub fn hit_test(g: &Geo, tab: Tab, x: f32, y: f32, scroll: f32, rows: usize, page: &settings::Page) -> Hit {
     if !g.pill.contains(x, y) {
         return Hit::None;
@@ -276,6 +285,9 @@ pub fn hit_test(g: &Geo, tab: Tab, x: f32, y: f32, scroll: f32, rows: usize, pag
         return Hit::Pin;
     }
     if matches!(tab, Tab::Clipboard | Tab::Timer) && g.clear.contains(x, y) {
+        return Hit::Clear;
+    }
+    if tab == Tab::Shelf && rows > 0 && g.clear.contains(x, y) {
         return Hit::Clear;
     }
     if tab == Tab::Settings && page.cat.is_some() && g.clear.contains(x, y) {
@@ -337,6 +349,11 @@ pub fn hit_test(g: &Geo, tab: Tab, x: f32, y: f32, scroll: f32, rows: usize, pag
                 return Hit::TimerReset;
             }
         }
+        Tab::Shelf => match shelf::tile_hit(g.content, rows, scroll, x, y) {
+            Some(shelf::TileHit::Item(i)) => return Hit::Tile(i),
+            Some(shelf::TileHit::Remove(i)) => return Hit::TileX(i),
+            None => {}
+        },
         Tab::System => {}
     }
     Hit::Body
@@ -484,6 +501,34 @@ mod tests {
         assert_eq!(hit_test(&g, Tab::Settings, g.tabs[0].cx(), g.tabs[0].cy(), 0.0, 0, &page), Hit::Tab(0));
         // Home-page cards do not exist on other tabs.
         assert_eq!(hit_test(&g, Tab::Media, r.cx(), r.cy(), 0.0, 0, &home()), Hit::Body);
+    }
+
+    #[test]
+    fn shelf_tab_hits_tiles_and_clear() {
+        let g = geo(Style::Notch);
+        let t = shelf::tile_rect(g.content, 2, 0.0);
+        assert_eq!(hit_test(&g, Tab::Shelf, t.cx(), t.cy(), 0.0, 3, &home()), Hit::Tile(2));
+        let x = shelf::x_rect(t);
+        assert_eq!(hit_test(&g, Tab::Shelf, x.cx(), x.cy(), 0.0, 3, &home()), Hit::TileX(2));
+        // no tile beyond the item count; empty shelf has no Clear button
+        assert_eq!(hit_test(&g, Tab::Shelf, t.cx(), t.cy(), 0.0, 2, &home()), Hit::Body);
+        assert_eq!(hit_test(&g, Tab::Shelf, g.clear.cx(), g.clear.cy(), 0.0, 3, &home()), Hit::Clear);
+        assert_eq!(hit_test(&g, Tab::Shelf, g.clear.cx(), g.clear.cy(), 0.0, 0, &home()), Hit::Body);
+        // tiles only exist on the Shelf tab
+        assert_eq!(hit_test(&g, Tab::System, t.cx(), t.cy(), 0.0, 3, &home()), Hit::Body);
+    }
+
+    #[test]
+    fn six_tabs_fit_between_the_header_slot_and_the_pin() {
+        let g = geo(Style::Notch);
+        assert_eq!(g.tabs.len(), 6);
+        assert!(g.tabs[0].x > g.clear.right());
+        assert!(g.tabs[5].right() < g.pin.x);
+        for w in g.tabs.windows(2) {
+            assert!(w[0].right() <= w[1].x);
+        }
+        assert_eq!(Tab::parse("shelf"), Some(Tab::Shelf));
+        assert_eq!(Tab::Shelf.index(), 4);
     }
 
     fn home() -> settings::Page {

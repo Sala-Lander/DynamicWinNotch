@@ -38,10 +38,12 @@ pub enum Sound {
     Alarm,
     /// A reminder comes due (plays once; falls back to `alarm.wav` if there is no `reminder.wav`).
     Reminder,
+    /// A file lands on the shelf.
+    Shelf,
 }
 
 impl Sound {
-    pub const ALL: [Sound; 9] = [
+    pub const ALL: [Sound; 10] = [
         Sound::Tick,
         Sound::Open,
         Sound::Close,
@@ -51,6 +53,7 @@ impl Sound {
         Sound::Bluetooth,
         Sound::Alarm,
         Sound::Reminder,
+        Sound::Shelf,
     ];
 
     /// File name (without `.wav`) of the user override for this sound.
@@ -65,6 +68,7 @@ impl Sound {
             Sound::Bluetooth => "bluetooth",
             Sound::Alarm => "alarm",
             Sound::Reminder => "reminder",
+            Sound::Shelf => "shelf",
         }
     }
 
@@ -99,6 +103,7 @@ const NOTIFY: &[Note] = &[n(784.0, 0, 140), n(1175.0, 120, 240)];
 const POWER: &[Note] = &[n(523.0, 0, 140), n(784.0, 120, 240)];
 const COPY: &[Note] = &[n(1000.0, 0, 50), n(1500.0, 60, 70)];
 const BLUETOOTH: &[Note] = &[n(659.0, 0, 140), n(880.0, 120, 220)];
+const SHELF: &[Note] = &[n(740.0, 0, 60), n(554.0, 50, 120)]; // a soft "plop"
 
 // Alarm tones (also used for reminders).
 const CHIME: &[Note] = &[n(523.0, 0, 380), n(659.0, 160, 380), n(784.0, 320, 380), n(1047.0, 480, 520)];
@@ -115,6 +120,7 @@ pub fn recipe(sound: Sound, tone: AlarmTone) -> &'static [Note] {
         Sound::Power => POWER,
         Sound::Copy => COPY,
         Sound::Bluetooth => BLUETOOTH,
+        Sound::Shelf => SHELF,
         Sound::Alarm | Sound::Reminder => match tone {
             AlarmTone::Beep => BEEP,
             AlarmTone::Bell => BELL,

@@ -768,3 +768,97 @@ pub const SND_MEMORY: u32 = 0x0004;
 extern "system" {
     pub fn PlaySoundW(sound: *const c_void, module: HANDLE, flags: u32) -> i32;
 }
+
+// ---- shelf (shelf.rs / win.rs): OLE drag and drop of files ---------------------------------
+pub const VK_LBUTTON: i32 = 0x01;
+pub const TYMED_HGLOBAL: u32 = 1;
+pub const DVASPECT_CONTENT: u32 = 1;
+pub const DROPEFFECT_NONE: u32 = 0;
+pub const DROPEFFECT_COPY: u32 = 1;
+pub const DRAGDROP_S_DROP: i32 = 0x0004_0100;
+pub const DRAGDROP_S_CANCEL: i32 = 0x0004_0101;
+pub const DRAGDROP_S_USEDEFAULTCURSORS: i32 = 0x0004_0102;
+pub const MK_LBUTTON: u32 = 0x0001;
+pub const S_OK: i32 = 0;
+pub const E_NOINTERFACE: i32 = 0x8000_4002u32 as i32;
+
+pub const IID_IUNKNOWN: GUID =
+    GUID { data1: 0, data2: 0, data3: 0, data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46] };
+pub const IID_IDROPTARGET: GUID =
+    GUID { data1: 0x0000_0122, data2: 0, data3: 0, data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46] };
+pub const IID_IDROPSOURCE: GUID =
+    GUID { data1: 0x0000_0121, data2: 0, data3: 0, data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46] };
+pub const IID_IDATAOBJECT: GUID =
+    GUID { data1: 0x0000_010E, data2: 0, data3: 0, data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46] };
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct POINTL {
+    pub x: i32,
+    pub y: i32,
+}
+
+#[repr(C)]
+pub struct FORMATETC {
+    pub cfFormat: u16,
+    pub ptd: *mut c_void,
+    pub dwAspect: u32,
+    pub lindex: i32,
+    pub tymed: u32,
+}
+
+#[repr(C)]
+pub struct STGMEDIUM {
+    pub tymed: u32,
+    /// The union: for `TYMED_HGLOBAL` the HGLOBAL (for CF_HDROP that is the HDROP).
+    pub handle: *mut c_void,
+    pub pUnkForRelease: *mut c_void,
+}
+
+#[link(name = "ole32")]
+extern "system" {
+    pub fn OleInitialize(reserved: *mut c_void) -> i32;
+    pub fn OleUninitialize();
+    pub fn RegisterDragDrop(hwnd: HANDLE, target: *mut c_void) -> i32;
+    pub fn RevokeDragDrop(hwnd: HANDLE) -> i32;
+    pub fn ReleaseStgMedium(medium: *mut STGMEDIUM);
+    pub fn DoDragDrop(data: *mut c_void, source: *mut c_void, ok_effects: u32, effect: *mut u32) -> i32;
+}
+
+#[link(name = "shell32")]
+extern "system" {
+    pub fn SHParseDisplayName(
+        name: *const u16,
+        bind_ctx: *mut c_void,
+        pidl: *mut *mut c_void,
+        attrs_in: u32,
+        attrs_out: *mut u32,
+    ) -> i32;
+    pub fn SHCreateDataObject(
+        pidl_folder: *const c_void,
+        count: u32,
+        pidls: *const *const c_void,
+        inner: *mut c_void,
+        riid: *const GUID,
+        out: *mut *mut c_void,
+    ) -> i32;
+    pub fn ILFree(pidl: *mut c_void);
+}
+
+#[link(name = "user32")]
+extern "system" {
+    pub fn GetAsyncKeyState(vk: i32) -> i16;
+}
+
+#[cfg(test)]
+mod shelf_abi_tests {
+    use super::*;
+
+    #[test]
+    fn ole_struct_sizes_match_win64_abi() {
+        assert_eq!(std::mem::size_of::<POINTL>(), 8);
+        assert_eq!(std::mem::size_of::<FORMATETC>(), 32);
+        assert_eq!(std::mem::size_of::<STGMEDIUM>(), 24);
+        assert_eq!(std::mem::size_of::<GUID>(), 16);
+    }
+}

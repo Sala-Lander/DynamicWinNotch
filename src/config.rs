@@ -101,6 +101,25 @@ pub enum AlarmRepeat {
     Loop,
 }
 
+/// What the Shelf stores for a dropped file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShelfMode {
+    /// Only the path: costs no disk space, but the original must stay where it is.
+    Links,
+    /// A private copy in `%APPDATA%\NotchIsland\shelf` (files only; folders stay links).
+    Copies,
+}
+
+/// When shelf items disappear by themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShelfExpire {
+    Never,
+    Hour,
+    Day,
+    /// The shelf is emptied when the island quits (and at the next start, after a crash).
+    OnQuit,
+}
+
 /// Event sounds, stored as a bit set in `Config::sound_events`.
 pub mod sev {
     pub const NOTIFY: u8 = 1 << 0;
@@ -184,6 +203,10 @@ pub struct Config {
     /// Coloured dot while an app uses the microphone (orange) or camera (green).
     pub privacy_dot: bool,
     pub dnd: Dnd,
+    /// Open the Shelf when you drag a file towards the island.
+    pub shelf_peek: bool,
+    pub shelf_mode: ShelfMode,
+    pub shelf_expire: ShelfExpire,
 }
 
 impl Default for Config {
@@ -213,9 +236,9 @@ impl Default for Config {
             sound_events: sev::ALL,
             alarm_tone: AlarmTone::Chime,
             alarm_repeat: AlarmRepeat::Three,
-            notifications: true,
+            notifications: false,
             fullscreen_mode: FullscreenMode::Hide,
-            net_speed: false,
+            net_speed: true,
             game_items: gb::DEFAULT,
             ping_host: "1.1.1.1".into(),
             volume_peek: true,
@@ -224,6 +247,9 @@ impl Default for Config {
             bt_peek: true,
             privacy_dot: true,
             dnd: Dnd::Off,
+            shelf_peek: true,
+            shelf_mode: ShelfMode::Links,
+            shelf_expire: ShelfExpire::Day,
         }
     }
 }
@@ -333,6 +359,19 @@ pub fn parse(text: &str) -> Config {
                     _ => Dnd::Off,
                 }
             }
+            "shelf_peek" => c.shelf_peek = truthy(v),
+            "shelf_mode" => {
+                c.shelf_mode =
+                    if v.eq_ignore_ascii_case("copies") || v.eq_ignore_ascii_case("copy") { ShelfMode::Copies } else { ShelfMode::Links }
+            }
+            "shelf_expire" => {
+                c.shelf_expire = match v.to_ascii_lowercase().as_str() {
+                    "never" | "off" | "0" => ShelfExpire::Never,
+                    "1h" | "hour" => ShelfExpire::Hour,
+                    "quit" | "on_quit" | "exit" => ShelfExpire::OnQuit,
+                    _ => ShelfExpire::Day,
+                }
+            }
             "gamebar_items" => c.game_items = gb::parse(v),
             "ping_host" if !v.is_empty() && v.len() <= 253 && !v.contains(char::is_whitespace) => {
                 c.ping_host = v.to_string()
@@ -351,6 +390,16 @@ pub fn path() -> Option<PathBuf> {
 /// Folder for your own sound files: `%APPDATA%\NotchIsland\sounds`.
 pub fn sounds_dir() -> Option<PathBuf> {
     Some(path()?.parent()?.join("sounds"))
+}
+
+/// Folder for the shelf's private copies: `%APPDATA%\NotchIsland\shelf`.
+pub fn shelf_dir() -> Option<PathBuf> {
+    Some(path()?.parent()?.join("shelf"))
+}
+
+/// The shelf's item list (paths only), so the shelf survives a restart.
+pub fn shelf_list() -> Option<PathBuf> {
+    Some(path()?.parent()?.join("shelf.txt"))
 }
 
 pub fn load() -> Config {
@@ -384,7 +433,7 @@ expand_on = {expand}
 # island = floating pill, a few pixels below the top edge
 style = {style}
 
-# Tab shown first: media | clipboard | system | timer | settings
+# Tab shown first: media | clipboard | system | timer | shelf | settings
 start_tab = {tab}
 
 # Milliseconds the pointer must rest on the notch before it expands (hover mode).
@@ -417,7 +466,7 @@ power_alerts = {power}
 
 # ---- Sounds ------------------------------------------------------------------------------
 # Want your own sounds? Tray menu -> \"Open sounds folder\", drop a .wav in with one of these
-# names (tick, open, close, notify, power, copy, bluetooth, alarm, reminder) and choose
+# names (tick, open, close, notify, power, copy, bluetooth, alarm, reminder, shelf) and choose
 # \"Reload config\". A file there always wins over the generated sound.
 
 # Master switch for every sound (1/0).
@@ -490,6 +539,19 @@ privacy_dot = {privdot}
 # notification, Bluetooth and mic / camera peeks; volume, lock keys, timer and battery stay.
 dnd = {dnd}
 
+# ---- Shelf -------------------------------------------------------------------------------
+# Drag a file onto the island and it waits on the Shelf tab; drag it out into any app later.
+# Open the Shelf automatically when you drag a file towards the island (1/0).
+shelf_peek = {shelfpeek}
+
+# What the shelf keeps of a dropped file: links | copies
+# links  = just the path (no disk space; the original must stay where it is)
+# copies = a private copy in %APPDATA%\\NotchIsland\\shelf (files only; folders stay links)
+shelf_mode = {shelfmode}
+
+# When shelf items clear themselves: never | 1h | 1d | quit
+shelf_expire = {shelfexpire}
+
 # Animation frame cap (15-240). The loop is vsync-paced, so this only limits very high refresh rates.
 fps_cap = {fps}
 
@@ -548,6 +610,14 @@ accent = {accent}
             Dnd::Games => "games",
         },
         netspeed = b(c.net_speed),
+        shelfpeek = b(c.shelf_peek),
+        shelfmode = if c.shelf_mode == ShelfMode::Copies { "copies" } else { "links" },
+        shelfexpire = match c.shelf_expire {
+            ShelfExpire::Never => "never",
+            ShelfExpire::Hour => "1h",
+            ShelfExpire::Day => "1d",
+            ShelfExpire::OnQuit => "quit",
+        },
     )
 }
 
@@ -624,6 +694,9 @@ mod tests {
             bt_peek: false,
             privacy_dot: false,
             dnd: Dnd::Games,
+            shelf_peek: false,
+            shelf_mode: ShelfMode::Copies,
+            shelf_expire: ShelfExpire::OnQuit,
         };
         assert_eq!(parse(&render(&c)), c);
     }
@@ -669,6 +742,22 @@ mod tests {
         assert_eq!(parse("alarm_tone = nonsense").alarm_tone, AlarmTone::Chime);
         // an explicit alarm_tone line after the legacy key wins
         assert_eq!(parse("timer_sound = 0\nalarm_tone = beep").alarm_tone, AlarmTone::Beep);
+    }
+
+    #[test]
+    fn shelf_keys_parse() {
+        let c = parse("shelf_peek = 0\nshelf_mode = Copies\nshelf_expire = 1h");
+        assert!(!c.shelf_peek);
+        assert_eq!(c.shelf_mode, ShelfMode::Copies);
+        assert_eq!(c.shelf_expire, ShelfExpire::Hour);
+        assert_eq!(parse("shelf_expire = never").shelf_expire, ShelfExpire::Never);
+        assert_eq!(parse("shelf_expire = quit").shelf_expire, ShelfExpire::OnQuit);
+        assert_eq!(parse("shelf_expire = 1d").shelf_expire, ShelfExpire::Day);
+        assert_eq!(parse("shelf_expire = bogus").shelf_expire, ShelfExpire::Day);
+        assert_eq!(parse("shelf_mode = bogus").shelf_mode, ShelfMode::Links);
+        assert_eq!(parse("start_tab = shelf").start_tab, Tab::Shelf);
+        let d = Config::default();
+        assert!(d.shelf_peek && d.shelf_mode == ShelfMode::Links && d.shelf_expire == ShelfExpire::Day);
     }
 
     #[test]
