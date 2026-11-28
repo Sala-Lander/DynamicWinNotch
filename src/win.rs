@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 
 pub const WM_APP_MEDIA: u32 = WM_APP + 1;
 pub const WM_APP_CLIP: u32 = WM_APP + 2;
@@ -108,8 +108,9 @@ pub fn lock_edge(held: &mut u32, vk: u16, msg: u32) -> Option<u16> {
 // While click-through the window is invisible to OLE, so `App` makes it hit-testable as soon as
 // the pointer is over the island with the button held (see `App::update`).
 //
-// Dragging out: a shell data object for the file (`SHCreateDataObject`) plus a tiny drop source
-// run inside `DoDragDrop`, which blocks until the user drops or cancels.
+// Dragging out: a hand-written `IDataObject` carrying a real `CF_HDROP` (a `DROPFILES` struct in
+// global memory, the same format Explorer and most apps read) plus a tiny drop source, run inside
+// `DoDragDrop`, which blocks until the user drops or cancels.
 thread_local! {
     static DROPPED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
@@ -117,6 +118,14 @@ thread_local! {
 static DRAG_OK: AtomicBool = AtomicBool::new(false);
 /// A drag *out of* the shelf is running: the shelf must not accept its own files back.
 static DRAGGING_OUT: AtomicBool = AtomicBool::new(false);
+/// The island's own window handle, set once in `register_drop_target`. `SHDoDragDrop` wants an
+/// owner HWND to anchor the shell's drag helper window to; 0 until the window exists.
+static OWNER_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// Drag/drop diagnostics, switched off now that drag-out is confirmed working: kept as a no-op
+/// (instead of ripping out every call site) in case it's needed again. Used to append one line to
+/// `%APPDATA%\NotchIsland\drag.log`, restarting the file once it passes 256 KB.
+fn drag_log(_msg: &str) {}
 
 /// Paths of the last drop (empties the list).
 pub fn take_dropped() -> Vec<String> {
@@ -215,6 +224,7 @@ unsafe fn read_files(data: *mut c_void) -> Vec<String> {
 
 unsafe extern "system" fn dt_drag_enter(_: *mut c_void, data: *mut c_void, _key: u32, _pt: POINTL, effect: *mut u32) -> i32 {
     let ok = !DRAGGING_OUT.load(Ordering::Relaxed) && has_files(data);
+    drag_log(&format!("island drag_enter files={ok} out_running={}", DRAGGING_OUT.load(Ordering::Relaxed)));
     DRAG_OK.store(ok, Ordering::Relaxed);
     if !effect.is_null() {
         *effect = if ok { DROPEFFECT_COPY } else { DROPEFFECT_NONE };
@@ -241,6 +251,7 @@ unsafe extern "system" fn dt_drag_leave(_: *mut c_void) -> i32 {
 
 unsafe extern "system" fn dt_drop(_: *mut c_void, data: *mut c_void, _key: u32, _pt: POINTL, effect: *mut u32) -> i32 {
     let ok = DRAG_OK.swap(false, Ordering::Relaxed);
+    drag_log(&format!("island drop accepted={ok}"));
     if !effect.is_null() {
         *effect = if ok { DROPEFFECT_COPY } else { DROPEFFECT_NONE };
     }
@@ -272,15 +283,24 @@ unsafe extern "system" fn ds_query(this: *mut c_void, riid: *const GUID, out: *m
 /// Esc cancels, releasing the left button drops, anything else keeps dragging.
 unsafe extern "system" fn ds_query_continue(_: *mut c_void, escape: i32, keys: u32) -> i32 {
     if escape != 0 {
+        drag_log("out: cancelled (Esc)");
         DRAGDROP_S_CANCEL
     } else if keys & MK_LBUTTON == 0 {
+        drag_log("out: button released -> drop");
         DRAGDROP_S_DROP
     } else {
         S_OK
     }
 }
 
-unsafe extern "system" fn ds_give_feedback(_: *mut c_void, _effect: u32) -> i32 {
+/// The last effect the target offered (`u32::MAX` = none yet). Logged only when it changes.
+static LAST_EFFECT: AtomicU32 = AtomicU32::new(u32::MAX);
+
+unsafe extern "system" fn ds_give_feedback(_: *mut c_void, effect: u32) -> i32 {
+    if LAST_EFFECT.swap(effect, Ordering::Relaxed) != effect {
+        // 0 = no target accepts the drop here, 1 = copy: the target under the pointer decides this.
+        drag_log(&format!("out: target effect={effect}"));
+    }
     DRAGDROP_S_USEDEFAULTCURSORS
 }
 
@@ -293,33 +313,326 @@ static DROP_SOURCE_VTBL: DropSourceVtbl = DropSourceVtbl {
 };
 static DROP_SOURCE: ComObj<DropSourceVtbl> = ComObj(&DROP_SOURCE_VTBL);
 
+// ---- a real IDataObject carrying CF_HDROP --------------------------------------------------
+//
+// `SHCreateDataObject` turned out to hand out a data object some drop targets (Explorer's view,
+// several browsers) do not fully accept: `DoDragDrop` reported `DRAGDROP_S_DROP` but the target's
+// offered effect was "scroll", never "copy", so nothing landed (see drag.log). A hand-built
+// `CF_HDROP` - the same bytes `GetOpenFileName`/Explorer itself produces - is the one format every
+// Windows app that accepts dropped files is written to read, so we build that directly instead.
+#[repr(C)]
+struct DataObjectVtbl {
+    query_interface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+    get_data: unsafe extern "system" fn(*mut c_void, *const FORMATETC, *mut STGMEDIUM) -> i32,
+    get_data_here: unsafe extern "system" fn(*mut c_void, *const FORMATETC, *mut STGMEDIUM) -> i32,
+    query_get_data: unsafe extern "system" fn(*mut c_void, *const FORMATETC) -> i32,
+    get_canonical_format_etc: unsafe extern "system" fn(*mut c_void, *const FORMATETC, *mut FORMATETC) -> i32,
+    set_data: unsafe extern "system" fn(*mut c_void, *const FORMATETC, *mut STGMEDIUM, i32) -> i32,
+    enum_format_etc: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32,
+    d_advise: unsafe extern "system" fn(*mut c_void, *const FORMATETC, u32, *mut c_void, *mut u32) -> i32,
+    d_unadvise: unsafe extern "system" fn(*mut c_void, u32) -> i32,
+    enum_d_advise: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32,
+}
+
+/// One `FileDataObject` per drag; freed by its own `Release` when the last reference drops.
+#[repr(C)]
+struct FileDataObject {
+    vtbl: *const DataObjectVtbl,
+    refs: AtomicU32,
+    path: String,
+}
+
+const DV_E_FORMATETC: i32 = 0x8004_0064u32 as i32;
+const OLE_E_ADVISENOTSUPPORTED: i32 = 0x8004_0003u32 as i32;
+const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
+const S_FALSE: i32 = 1;
+
+fn is_hdrop(fmt: &FORMATETC) -> bool {
+    fmt.cfFormat == CF_HDROP as u16 && (fmt.tymed & TYMED_HGLOBAL) != 0 && fmt.dwAspect == DVASPECT_CONTENT
+}
+
+/// A `DROPFILES` header followed by `path` as a double-NUL-terminated wide string, in a global
+/// memory block a receiver takes ownership of (and frees with `GlobalFree`, via `ReleaseStgMedium`).
+unsafe fn hdrop_global(path: &str) -> *mut c_void {
+    let wide_path = wide(path); // already NUL-terminated
+    let header = std::mem::size_of::<DROPFILES>();
+    let list_bytes = (wide_path.len() + 1) * 2; // + the list's own terminating NUL
+    let mem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, header + list_bytes);
+    if mem.is_null() {
+        return null_mut();
+    }
+    let base = GlobalLock(mem);
+    if base.is_null() {
+        GlobalFree(mem);
+        return null_mut();
+    }
+    let hdr = &mut *(base as *mut DROPFILES);
+    hdr.p_files = header as u32;
+    hdr.pt_x = 0;
+    hdr.pt_y = 0;
+    hdr.f_nc = 0;
+    hdr.f_wide = 1;
+    let dst = (base as *mut u8).add(header) as *mut u16;
+    std::ptr::copy_nonoverlapping(wide_path.as_ptr(), dst, wide_path.len());
+    *dst.add(wide_path.len()) = 0; // second NUL: ends the (single-entry) list
+    GlobalUnlock(mem);
+    mem
+}
+
+/// The last unsupported interface we logged a QueryInterface miss for (dedup; `data1` is enough
+/// to tell interfaces apart here). Reset at the start of every drag.
+static LAST_UNK_RIID: AtomicU32 = AtomicU32::new(u32::MAX);
+
+unsafe extern "system" fn fdo_query(this: *mut c_void, riid: *const GUID, out: *mut *mut c_void) -> i32 {
+    if !riid.is_null() && (*riid == IID_IUNKNOWN || *riid == IID_IDATAOBJECT) {
+        fdo_add_ref(this);
+        *out = this;
+        S_OK
+    } else {
+        *out = null_mut();
+        let id = if riid.is_null() { 0 } else { (*riid).data1 };
+        if LAST_UNK_RIID.swap(id, Ordering::Relaxed) != id {
+            drag_log(&format!("out: data QueryInterface refused riid.data1={id:#010x}"));
+        }
+        E_NOINTERFACE
+    }
+}
+
+unsafe extern "system" fn fdo_add_ref(this: *mut c_void) -> u32 {
+    (*(this as *mut FileDataObject)).refs.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+unsafe extern "system" fn fdo_release(this: *mut c_void) -> u32 {
+    let obj = this as *mut FileDataObject;
+    let left = (*obj).refs.fetch_sub(1, Ordering::Relaxed) - 1;
+    if left == 0 {
+        drop(Box::from_raw(obj));
+    }
+    left
+}
+
+/// The last refused format we logged (so a target probing 20 formats a frame doesn't flood the
+/// log with the same lines); reset at the start of every drag.
+static LAST_REFUSED: AtomicU32 = AtomicU32::new(u32::MAX);
+
+unsafe extern "system" fn fdo_get_data(this: *mut c_void, fmt: *const FORMATETC, med: *mut STGMEDIUM) -> i32 {
+    let obj = &*(this as *const FileDataObject);
+    if fmt.is_null() || !is_hdrop(&*fmt) {
+        let cf = if fmt.is_null() { 0 } else { (*fmt).cfFormat } as u32;
+        if LAST_REFUSED.swap(cf, Ordering::Relaxed) != cf {
+            drag_log(&format!("out: data GetData refused cf={cf}"));
+        }
+        return DV_E_FORMATETC;
+    }
+    LAST_REFUSED.store(u32::MAX, Ordering::Relaxed);
+    let mem = hdrop_global(&obj.path);
+    if mem.is_null() {
+        drag_log("out: data GetData: GlobalAlloc failed");
+        return E_OUTOFMEMORY;
+    }
+    *med = STGMEDIUM { tymed: TYMED_HGLOBAL, handle: mem, pUnkForRelease: null_mut() };
+    drag_log("out: data GetData CF_HDROP ok");
+    S_OK
+}
+
+unsafe extern "system" fn fdo_get_data_here(_: *mut c_void, _: *const FORMATETC, _: *mut STGMEDIUM) -> i32 {
+    E_NOTIMPL
+}
+
+unsafe extern "system" fn fdo_query_get_data(_: *mut c_void, fmt: *const FORMATETC) -> i32 {
+    let ok = !fmt.is_null() && is_hdrop(&*fmt);
+    let cf = if fmt.is_null() { 0 } else { (*fmt).cfFormat } as u32;
+    if ok {
+        drag_log(&format!("out: data QueryGetData cf={cf} -> true"));
+    } else if LAST_REFUSED.swap(cf, Ordering::Relaxed) != cf {
+        drag_log(&format!("out: data QueryGetData cf={cf} -> false"));
+    }
+    if ok {
+        S_OK
+    } else {
+        DV_E_FORMATETC
+    }
+}
+
+unsafe extern "system" fn fdo_canonical(_: *mut c_void, _: *const FORMATETC, _: *mut FORMATETC) -> i32 {
+    E_NOTIMPL
+}
+unsafe extern "system" fn fdo_set_data(_: *mut c_void, _: *const FORMATETC, _: *mut STGMEDIUM, _: i32) -> i32 {
+    E_NOTIMPL
+}
+unsafe extern "system" fn fdo_enum_format_etc(_: *mut c_void, direction: u32, out: *mut *mut c_void) -> i32 {
+    // Explorer's own shell views (Desktop, folder windows) probe `EnumFormatEtc` at drag-enter to
+    // learn what the source offers *before* ever calling `GetData`; a source that only answers
+    // `QueryGetData`/`GetData` (as this one used to) looks format-less to them and they silently
+    // never ask for CF_HDROP at all - matching logs where the drop target never queries cf=15 and
+    // the drag ends in DROPEFFECT_NONE. Simpler targets (a browser's drop handler, an app shortcut's
+    // own "open with dropped file") query CF_HDROP directly and never needed this. DATADIR_GET (1)
+    // gets the one format we offer; DATADIR_SET (2) gets an empty enumerator, we accept nothing.
+    const DATADIR_GET: u32 = 1;
+    drag_log(&format!("out: data EnumFormatEtc direction={direction}"));
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    let obj = Box::into_raw(Box::new(FormatEnum { vtbl: &FORMAT_ENUM_VTBL, refs: AtomicU32::new(1), pos: AtomicU32::new(0), len: if direction == DATADIR_GET { 1 } else { 0 } }));
+    *out = obj as *mut c_void;
+    S_OK
+}
+
+/// One `FORMATETC` entry: `CF_HDROP`/`TYMED_HGLOBAL`/`DVASPECT_CONTENT`, `lindex` -1 (whole object).
+fn hdrop_format_etc() -> FORMATETC {
+    FORMATETC { cfFormat: CF_HDROP as u16, ptd: null_mut(), dwAspect: DVASPECT_CONTENT, lindex: -1, tymed: TYMED_HGLOBAL }
+}
+
+#[repr(C)]
+struct EnumVtbl {
+    query_interface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+    next: unsafe extern "system" fn(*mut c_void, u32, *mut FORMATETC, *mut u32) -> i32,
+    skip: unsafe extern "system" fn(*mut c_void, u32) -> i32,
+    reset: unsafe extern "system" fn(*mut c_void) -> i32,
+    clone: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32,
+}
+
+/// `IEnumFORMATETC` over a fixed list of 0 or 1 entries (just `CF_HDROP`). One per `EnumFormatEtc`
+/// call (and one more per `Clone`); refcounted and freed the same way as `FileDataObject`.
+#[repr(C)]
+struct FormatEnum {
+    vtbl: *const EnumVtbl,
+    refs: AtomicU32,
+    pos: AtomicU32,
+    len: u32,
+}
+
+unsafe extern "system" fn fe_query(this: *mut c_void, riid: *const GUID, out: *mut *mut c_void) -> i32 {
+    if !riid.is_null() && (*riid == IID_IUNKNOWN || *riid == IID_IENUMFORMATETC) {
+        fe_add_ref(this);
+        *out = this;
+        S_OK
+    } else {
+        *out = null_mut();
+        E_NOINTERFACE
+    }
+}
+unsafe extern "system" fn fe_add_ref(this: *mut c_void) -> u32 {
+    (*(this as *mut FormatEnum)).refs.fetch_add(1, Ordering::Relaxed) + 1
+}
+unsafe extern "system" fn fe_release(this: *mut c_void) -> u32 {
+    let obj = this as *mut FormatEnum;
+    let left = (*obj).refs.fetch_sub(1, Ordering::Relaxed) - 1;
+    if left == 0 {
+        drop(Box::from_raw(obj));
+    }
+    left
+}
+unsafe extern "system" fn fe_next(this: *mut c_void, celt: u32, rg: *mut FORMATETC, fetched: *mut u32) -> i32 {
+    let obj = &*(this as *const FormatEnum);
+    let mut n = 0u32;
+    while n < celt {
+        let pos = obj.pos.load(Ordering::Relaxed);
+        if pos >= obj.len {
+            break;
+        }
+        obj.pos.store(pos + 1, Ordering::Relaxed);
+        if !rg.is_null() {
+            *rg.add(n as usize) = hdrop_format_etc();
+        }
+        n += 1;
+    }
+    if !fetched.is_null() {
+        *fetched = n;
+    }
+    drag_log(&format!("out: data EnumFormatEtc.Next celt={celt} got={n}"));
+    if n == celt {
+        S_OK
+    } else {
+        S_FALSE
+    }
+}
+unsafe extern "system" fn fe_skip(this: *mut c_void, celt: u32) -> i32 {
+    let obj = &*(this as *const FormatEnum);
+    let pos = obj.pos.load(Ordering::Relaxed);
+    let new_pos = pos.saturating_add(celt);
+    obj.pos.store(new_pos.min(obj.len), Ordering::Relaxed);
+    if new_pos > obj.len {
+        S_FALSE
+    } else {
+        S_OK
+    }
+}
+unsafe extern "system" fn fe_reset(this: *mut c_void) -> i32 {
+    (*(this as *const FormatEnum)).pos.store(0, Ordering::Relaxed);
+    S_OK
+}
+unsafe extern "system" fn fe_clone(this: *mut c_void, out: *mut *mut c_void) -> i32 {
+    let obj = &*(this as *const FormatEnum);
+    let clone = Box::into_raw(Box::new(FormatEnum {
+        vtbl: obj.vtbl,
+        refs: AtomicU32::new(1),
+        pos: AtomicU32::new(obj.pos.load(Ordering::Relaxed)),
+        len: obj.len,
+    }));
+    *out = clone as *mut c_void;
+    S_OK
+}
+
+static FORMAT_ENUM_VTBL: EnumVtbl =
+    EnumVtbl { query_interface: fe_query, add_ref: fe_add_ref, release: fe_release, next: fe_next, skip: fe_skip, reset: fe_reset, clone: fe_clone };
+unsafe extern "system" fn fdo_d_advise(_: *mut c_void, _: *const FORMATETC, _: u32, _: *mut c_void, _: *mut u32) -> i32 {
+    OLE_E_ADVISENOTSUPPORTED
+}
+unsafe extern "system" fn fdo_d_unadvise(_: *mut c_void, _: u32) -> i32 {
+    OLE_E_ADVISENOTSUPPORTED
+}
+unsafe extern "system" fn fdo_enum_d_advise(_: *mut c_void, out: *mut *mut c_void) -> i32 {
+    if !out.is_null() {
+        *out = null_mut();
+    }
+    OLE_E_ADVISENOTSUPPORTED
+}
+
+static DATA_OBJECT_VTBL: DataObjectVtbl = DataObjectVtbl {
+    query_interface: fdo_query,
+    add_ref: fdo_add_ref,
+    release: fdo_release,
+    get_data: fdo_get_data,
+    get_data_here: fdo_get_data_here,
+    query_get_data: fdo_query_get_data,
+    get_canonical_format_etc: fdo_canonical,
+    set_data: fdo_set_data,
+    enum_format_etc: fdo_enum_format_etc,
+    d_advise: fdo_d_advise,
+    d_unadvise: fdo_d_unadvise,
+    enum_d_advise: fdo_enum_d_advise,
+};
+
 /// Drag `path` out of the island into whatever app is under the pointer. Blocks until the user
 /// drops or cancels (the left button must be down). Returns false if the drag could not start.
 pub fn drag_out(path: &str) -> bool {
     unsafe {
-        let name = wide(path);
-        let mut pidl: *mut c_void = null_mut();
-        if SHParseDisplayName(name.as_ptr(), null_mut(), &mut pidl, 0, null_mut()) < 0 || pidl.is_null() {
-            return false;
-        }
-        let list = [pidl as *const c_void];
-        let mut data: *mut c_void = null_mut();
-        let hr = SHCreateDataObject(null(), 1, list.as_ptr(), null_mut(), &IID_IDATAOBJECT, &mut data);
-        ILFree(pidl);
-        if hr < 0 || data.is_null() {
-            return false;
-        }
+        drag_log(&format!("out: start path={path} lmb={}", lmb_down()));
+        let obj = Box::into_raw(Box::new(FileDataObject {
+            vtbl: &DATA_OBJECT_VTBL,
+            refs: AtomicU32::new(1),
+            path: path.to_string(),
+        }));
         DRAGGING_OUT.store(true, Ordering::Relaxed);
+        LAST_EFFECT.store(u32::MAX, Ordering::Relaxed);
+        LAST_REFUSED.store(u32::MAX, Ordering::Relaxed);
+        LAST_UNK_RIID.store(u32::MAX, Ordering::Relaxed);
         let mut effect = 0u32;
+        let owner = OWNER_HWND.load(Ordering::Relaxed);
         // Copy only: dragging out of the shelf never moves or deletes the original.
-        DoDragDrop(data, &DROP_SOURCE as *const _ as *mut c_void, DROPEFFECT_COPY, &mut effect);
+        // SHDoDragDrop (not the raw ole32 DoDragDrop) is the shell-aware wrapper Explorer expects:
+        // it negotiates the shell's private drag-image/helper clipboard formats, which is why a
+        // plain DoDragDrop drag got stuck offering DROPEFFECT_SCROLL only and never DROPEFFECT_COPY.
+        let hr = SHDoDragDrop(owner, obj as *mut c_void, &DROP_SOURCE as *const _ as *mut c_void, DROPEFFECT_COPY, &mut effect);
+        drag_log(&format!("out: SHDoDragDrop owner={owner:#x} hr={:#010x} effect={effect}", hr as u32));
         DRAGGING_OUT.store(false, Ordering::Relaxed);
-        // IUnknown::Release (vtable slot 2) on the data object we created.
-        type Release = unsafe extern "system" fn(*mut c_void) -> u32;
-        let vtbl = *(data as *const *const usize);
-        let release: Release = std::mem::transmute(*vtbl.add(2));
-        release(data);
-        true
+        fdo_release(obj as *mut c_void); // our own reference; the object frees itself at refcount 0
+        hr == DRAGDROP_S_DROP && effect != DROPEFFECT_NONE
     }
 }
 
@@ -840,6 +1153,7 @@ impl Win {
             if OleInitialize(null_mut()) >= 0 {
                 RegisterDragDrop(self.hwnd, &DROP_TARGET as *const _ as *mut c_void);
             }
+            OWNER_HWND.store(self.hwnd, Ordering::Relaxed);
         }
     }
 

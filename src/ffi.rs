@@ -781,6 +781,8 @@ pub const DRAGDROP_S_USEDEFAULTCURSORS: i32 = 0x0004_0102;
 pub const MK_LBUTTON: u32 = 0x0001;
 pub const S_OK: i32 = 0;
 pub const E_NOINTERFACE: i32 = 0x8000_4002u32 as i32;
+pub const E_NOTIMPL: i32 = 0x8000_4001u32 as i32;
+pub const E_OUTOFMEMORY: i32 = 0x8007_000Eu32 as i32;
 
 pub const IID_IUNKNOWN: GUID =
     GUID { data1: 0, data2: 0, data3: 0, data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46] };
@@ -790,6 +792,19 @@ pub const IID_IDROPSOURCE: GUID =
     GUID { data1: 0x0000_0121, data2: 0, data3: 0, data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46] };
 pub const IID_IDATAOBJECT: GUID =
     GUID { data1: 0x0000_010E, data2: 0, data3: 0, data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46] };
+pub const IID_IENUMFORMATETC: GUID =
+    GUID { data1: 0x0000_0103, data2: 0, data3: 0, data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46] };
+
+/// Header of the `CF_HDROP` clipboard/drag format: a `DROPFILES` struct followed by a
+/// double-NUL-terminated list of wide file paths (single-NUL between entries).
+#[repr(C)]
+pub struct DROPFILES {
+    pub p_files: u32,
+    pub pt_x: i32,
+    pub pt_y: i32,
+    pub f_nc: i32,
+    pub f_wide: i32,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -827,22 +842,26 @@ extern "system" {
 
 #[link(name = "shell32")]
 extern "system" {
-    pub fn SHParseDisplayName(
-        name: *const u16,
-        bind_ctx: *mut c_void,
-        pidl: *mut *mut c_void,
-        attrs_in: u32,
-        attrs_out: *mut u32,
-    ) -> i32;
-    pub fn SHCreateDataObject(
-        pidl_folder: *const c_void,
-        count: u32,
-        pidls: *const *const c_void,
-        inner: *mut c_void,
-        riid: *const GUID,
-        out: *mut *mut c_void,
-    ) -> i32;
-    pub fn ILFree(pidl: *mut c_void);
+    // Like `DoDragDrop`, but also negotiates the shell's own drag-image / "in shell drag loop"
+    // clipboard formats with the target - needed for Explorer to offer DROPEFFECT_COPY for more
+    // than an instant (a raw `DoDragDrop` drag falls back to "scroll only" once the shell's
+    // private formats go unanswered). `hwnd_owner` may be `0`.
+    pub fn SHDoDragDrop(hwnd_owner: HANDLE, data: *mut c_void, source: *mut c_void, ok_effects: u32, effect: *mut u32) -> i32;
+}
+
+#[link(name = "shell32")]
+extern "system" {
+    }
+
+pub const GMEM_MOVEABLE: u32 = 0x0002;
+pub const GMEM_ZEROINIT: u32 = 0x0040;
+
+#[link(name = "kernel32")]
+extern "system" {
+    pub fn GlobalAlloc(flags: u32, bytes: usize) -> *mut c_void;
+    pub fn GlobalLock(mem: *mut c_void) -> *mut c_void;
+    pub fn GlobalUnlock(mem: *mut c_void) -> i32;
+    pub fn GlobalFree(mem: *mut c_void) -> *mut c_void;
 }
 
 #[link(name = "user32")]
